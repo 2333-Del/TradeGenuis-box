@@ -1,0 +1,17 @@
+# macOS / Linux
+.DS_Store
+__pycache__/
+*.pyc
+
+# 运行期生成的数据（含真实扫描结果与用户配置，勿提交）
+data/watchlist.json
+data/crypto.json
+data/universe.json
+data/mkt_cache.json
+data/config.json
+data/sectors.json
+
+# 本地环境
+.venv/
+venv/
+*.log

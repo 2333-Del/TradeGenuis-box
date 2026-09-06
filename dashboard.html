@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="TradeGenuis 箱体突破：四条件全市场自动扫描，达标标的实时呈现。" />
+  <title>TradeGenuis · 箱体突破</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231C223A'/%3E%3Crect x='14' y='26' width='28' height='24' rx='3' fill='none' stroke='%239BD597' stroke-width='4'/%3E%3Cpath d='M38 18 L50 18 L50 30 M50 18 L38 30' stroke='%239BD597' stroke-width='4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <style>
+    @font-face { font-family: "Outfit"; font-style: normal; font-weight: 400 700; font-display: swap;
+      src: url("static/fonts/outfit-latin.woff2") format("woff2"); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+25A0-25FF, U+FFFD; }
+    @font-face { font-family: "Outfit"; font-style: normal; font-weight: 400 700; font-display: swap;
+      src: url("static/fonts/outfit-latin-ext.woff2") format("woff2"); unicode-range: U+0100-024F, U+0259, U+1E00-1EFF, U+2020, U+20A0-20AB, U+20AD-20CF, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+    @font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 400; font-display: swap;
+      src: url("static/fonts/ibmplexmono-400-latin.woff2") format("woff2"); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+25A0-25FF, U+FEFF, U+FFFD; }
+    @font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 400; font-display: swap;
+      src: url("static/fonts/ibmplexmono-400-latin-ext.woff2") format("woff2"); unicode-range: U+0100-024F, U+0259, U+1E00-1EFF, U+2020, U+20A0-20AB, U+20AD-20CF, U+2113, U+2C60-2C7F, U+A720-A7FF; }
+    @font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 500; font-display: swap;
+      src: url("static/fonts/ibmplexmono-500-latin.woff2") format("woff2"); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+25A0-25FF, U+FEFF, U+FFFD; }
+    @font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 700; font-display: swap;
+      src: url("static/fonts/ibmplexmono-700-latin.woff2") format("woff2"); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+25A0-25FF, U+25A0-25FF, U+FEFF, U+FFFD; }
+
+    /* TradeGenuis 深色主题（对齐 dark.css 定稿） */
+    :root {
+      --bg: #1C223A;
+      --card: rgba(229, 212, 182, 0.045);
+      --card-border: rgba(229, 212, 182, 0.13);
+      --ink: #E5D4B6;
+      --ink-dim: rgba(229, 212, 182, 0.68);
+      --ink-faint: rgba(229, 212, 182, 0.44);
+      --line: rgba(229, 212, 182, 0.12);
+      --chip: rgba(229, 212, 182, 0.10);
+      --hover: rgba(229, 212, 182, 0.06);
+      --mint: #8FC98B;
+      --up: #9BD597;
+      --coral: #E2604F;
+      --down: #F07A63;
+      --orange: #F44E1C;
+      --sand-card: #E5D4B6;
+      --sand-ink: #1C223A;
+      --pop: #232A48;
+      --num: "Outfit", sans-serif;
+      --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+      --sans: "Noto Sans SC", -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      --r: 18px;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 13px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+    ::selection { background: rgba(143,201,139,.3); }
+    :focus-visible { outline: 2px solid var(--ink-faint); outline-offset: 2px; border-radius: 6px; }
+    .num { font-family: var(--num); font-variant-numeric: tabular-nums; }
+    .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .up { color: var(--up); } .down { color: var(--down); } .flat { color: var(--ink-faint); }
+
+    /* 全宽自适应：无两侧大量留白 */
+    .page { width: 100%; max-width: none; margin: 0 auto; padding: 12px 14px 30px; display: flex; flex-direction: column; gap: 10px; }
+
+    /* ================= banner（品牌 pill 风格） ================= */
+    .banner {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 0 0 auto;
+      padding: 8px 10px; background: var(--card); border: 1px solid var(--card-border); border-radius: var(--r);
+    }
+    .wordmark { font-family: var(--num); font-weight: 700; font-size: 16px; white-space: nowrap; }
+    .brand { display: flex; align-items: baseline; gap: 8px; }
+    .brand .b-sub { font-size: 12px; color: var(--ink-faint); }
+    .pill {
+      display: flex; align-items: center; gap: 7px;
+      background: var(--card); border: 1px solid var(--card-border);
+      border-radius: 999px; padding: 5px 13px;
+      font-size: 12px; color: var(--ink-dim); white-space: nowrap;
+    }
+    .pill b { font-family: var(--num); font-weight: 600; color: var(--ink); }
+    .pill .k { color: var(--ink-faint); }
+    .autodrop { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .autodrop input { accent-color: var(--mint); width: 14px; height: 14px; cursor: pointer; }
+    .mode-tag { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+    #hotTopics { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-left: auto; font-size: 11.5px; color: var(--ink-dim); }
+    .hot-chip { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); background: var(--chip); border: 1px solid var(--card-border); border-radius: 999px; padding: 2px 9px; white-space: nowrap; cursor: pointer; transition: color .15s, border-color .15s, background .15s; }
+    .hot-chip:hover { color: var(--ink); border-color: var(--ink-faint); }
+    .hot-chip.sel { color: var(--mint-ink); background: var(--up); border-color: var(--up); font-weight: 600; }
+    .hot-chip .h-chg { font-size: 10px; }
+    .banner-input {
+      border: 1px solid var(--card-border); border-radius: 999px; background: var(--chip);
+      padding: 5px 12px; font-size: 12px; font-family: var(--mono); color: var(--ink);
+      width: 128px; transition: border-color .2s; outline: none;
+    }
+    .banner-input:focus { border-color: var(--mint); }
+    .mini-save {
+      border: 1px solid var(--card-border); border-radius: 999px; background: transparent;
+      color: var(--ink-dim); font-size: 12px; padding: 5px 14px; cursor: pointer;
+      transition: color .2s, background .2s, transform .15s;
+    }
+    .mini-save:hover { color: var(--ink); background: var(--hover); }
+    .mini-save:active { transform: scale(.97); }
+    .grow { flex: 1; }
+    .tabs { display: flex; gap: 4px; background: var(--chip); border-radius: 999px; padding: 3px; }
+    .tab { border: none; background: transparent; color: var(--ink-dim); font-size: 12px; font-weight: 500; padding: 5px 14px; border-radius: 999px; cursor: pointer; transition: color .2s, background .2s; }
+    .tab.on { background: rgba(229,212,182,.16); color: var(--ink); }
+    .act { border: none; border-radius: 999px; font-size: 13px; font-weight: 600; letter-spacing: .08em; padding: 8px 20px; cursor: pointer; transition: filter .2s, transform .1s; color: var(--ink); }
+    .act:active { transform: translateY(1px); }
+    .act:disabled { opacity: .5; cursor: not-allowed; }
+    .act.go { background: var(--orange); color: #fff; }
+    .act.go:hover { filter: brightness(1.08); }
+
+    /* ================= 内容区 ================= */
+    .card { background: var(--card); border: 1px solid var(--card-border); border-radius: var(--r); padding: 14px 16px; }
+    .sec-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+    .sec-head h3 { font-size: 14px; font-weight: 700; }
+    .plan-count { font-family: var(--num); font-size: 12px; color: var(--up); background: rgba(155,213,151,.12); border-radius: 999px; padding: 1px 9px; }
+
+    /* 达标卡片 */
+    .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 10px; }
+    .sig { background: var(--card); border: 1px solid var(--card-border); border-radius: var(--r); padding: 12px 14px 10px; animation: rise .45s cubic-bezier(.2,.7,.3,1) both; }
+    .sig.q { border-color: rgba(155,213,151,.5); box-shadow: 0 0 0 1px rgba(155,213,151,.2); }
+    .q-badge { display: inline-block; margin-left: 7px; padding: 0 7px; border-radius: 999px; font-family: var(--num); font-size: 11px; font-weight: 600; color: var(--mint-ink); background: var(--up); vertical-align: 1px; }
+    @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+    .sig-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+    .sig .nm { font-size: 14px; font-weight: 700; white-space: nowrap; }
+    .sig .cd { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
+    .sig-top-right { display: flex; align-items: baseline; gap: 8px; }
+    .sig-top-right .px { font-family: var(--num); font-size: 18px; font-weight: 700; }
+    .sig-top-right .chg { font-family: var(--num); font-size: 12.5px; font-weight: 600; }
+    .score-badge { display: inline-flex; min-width: 38px; height: 26px; padding: 0 8px; align-items: center; justify-content: center; border-radius: 999px; font-family: var(--num); font-weight: 700; font-size: 14px; color: var(--up); background: rgba(155,213,151,.12); margin-left: 4px; }
+    .sig-chart { position: relative; margin-top: 8px; }
+    .sig-chart canvas { width: 100%; height: 264px; display: block; }
+    .tip { position: absolute; pointer-events: none; background: var(--pop); border: 1px solid var(--card-border); border-radius: 8px; padding: 6px 9px; font-family: var(--mono); font-size: 11.5px; display: none; z-index: 5; line-height: 1.6; color: var(--ink); }
+    .sig-line { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-dim); }
+    .sig-line b { color: var(--up); font-weight: 600; }
+    .sig-line span.no { color: var(--ink-faint); }
+    .sig-line .box { font-family: var(--mono); color: var(--ink-faint); font-size: 11.5px; }
+
+    /* 空态 / 骨架 */
+    .empty { color: var(--ink-faint); font-size: 12px; padding: 26px 0; text-align: center; }
+    .empty .big { font-family: var(--num); font-size: 18px; font-weight: 700; letter-spacing: .14em; margin-bottom: 8px; }
+    .empty p { margin-bottom: 14px; }
+    .skel-card { height: 330px; border-radius: var(--r); background: linear-gradient(90deg, rgba(229,212,182,.045) 25%, rgba(229,212,182,.09) 38%, rgba(229,212,182,.045) 63%); background-size: 400% 100%; animation: shimmer 1.5s ease infinite; }
+    @keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+
+    /* toast（品牌弹层色） */
+    .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px); background: var(--pop); color: var(--ink); border: 1px solid var(--card-border); border-radius: 999px; padding: 8px 20px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .25s, transform .25s; z-index: 90; }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* ================= 响应式 ================= */
+    @media (max-width: 900px) {
+      .cards { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+      .banner-input { width: 110px; }
+      .brand .b-sub { display: none; }
+    }
+    @media (max-width: 560px) {
+      .page { padding: 10px 8px 24px; }
+      .cards { grid-template-columns: 1fr; }
+      .banner { padding: 8px; gap: 8px; }
+      .banner-input { width: 96px; }
+      .pill { padding: 4px 10px; }
+      .sig-chart canvas { height: 230px; }
+    }
+  </style>
+</head>
+<body>
+<div class="page">
+  <div class="banner">
+    <div class="brand"><span class="wordmark">TradeGenuis</span><span class="b-sub">箱体突破</span></div>
+    <span class="pill"><span class="k">达标</span><b class="num" id="hpHit">—</b></span>
+    <span class="pill"><span class="k">覆盖</span><b class="num" id="hpCover">—</b></span>
+    <label class="pill autodrop" title="每个交易日午间收盘与收盘自动全市场扫描">
+      <input type="checkbox" id="autoCb" /><span>自动扫描</span><span class="mode-tag" id="autoTimes">11:30 / 15:00</span>
+    </label>
+    <span class="grow"></span>
+    <div class="tabs" id="marketTabs">
+      <button class="tab on" data-market="stock" type="button">A股</button>
+      <button class="tab" data-market="crypto" type="button">加密货币</button>
+    </div>
+    <button class="act go" id="btnScan" type="button">全市场扫描</button>
+  </div>
+
+  <section class="card">
+    <div class="sec-head">
+      <h3 id="cardsTitle">今日达标 <span class="plan-count" id="poolCount"></span></h3>
+      <span class="mode-tag" id="hotTopics" style="display:none"></span>
+    </div>
+    <div class="cards" id="cards"></div>
+  </section>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const S = { watch: null, crypto: null, status: null, cfg: null, hot: [], loaded: false, kbars: {}, market: "stock", selBoard: null };
+const $ = id => document.getElementById(id);
+const fmt2 = v => (v === null || v === undefined || isNaN(v)) ? "—" : Number(v).toFixed(2);
+const fmtc = v => (v === null || v === undefined || isNaN(v)) ? "—" : (v >= 1 ? Number(v).toFixed(2) : Number(v).toPrecision(4));
+const sign = v => (v > 0 ? "+" : "") + fmt2(v);
+// A股涨红跌绿；币圈涨绿跌红
+const clsOf = v => v > 0 ? "up" : v < 0 ? "down" : "flat";
+const signOf = (v, market) => (v > 0 ? "+" : "") + (market === "crypto" ? fmtc(v) : fmt2(v));
+const moneyW = w => w === null || w === undefined ? "—" :
+  Math.abs(w) >= 10000 ? (w / 10000).toFixed(1) + "亿" : Math.round(w) + "万";
+
+let toastTimer = null;
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg; t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 1800);
+}
+
+async function jfetch(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+async function loadAll() {
+  const [w, c, st, cfg, hot] = await Promise.all([
+    jfetch("api/watchlist"),
+    jfetch("api/crypto").catch(() => null),
+    jfetch("api/status").catch(() => null),
+    jfetch("api/config").catch(() => null),
+    jfetch("api/hot").catch(() => ({ hot_topics: [] })),
+  ]);
+  S.watch = w; S.crypto = c; S.status = st; S.cfg = cfg; S.hot = hot.hot_topics || []; S.loaded = true;
+  renderAll();
+}
+async function refresh() { try { await loadAll(); } catch (e) {} }
+
+/* =============================== 渲染 =============================== */
+function renderAll() {
+  const isCrypto = S.market === "crypto";
+  const data = isCrypto ? (S.crypto || {}) : (S.watch || {});
+  const rows = data.candidates || [];
+  const hits = rows.filter(r => r.qualified);
+  const scope = data.scope;
+
+  $("hpHit").textContent = S.loaded ? hits.length : "—";
+  $("hpCover").textContent = S.loaded
+    ? (scope === "crypto" ? (data.universe_size ?? "—") + " 币" :
+       scope === "market" ? (data.universe_size ?? "—") + " 只" : "自选池")
+    : "—";
+  $("poolCount").textContent = S.loaded ? hits.length : "";
+  if (scope === "crypto") {
+    $("cardsTitle").innerHTML = `币圈涨幅榜 <span class="plan-count" id="poolCount">${S.loaded ? rows.length : ""}</span> <span class="mode-tag" style="color:var(--up)">达标 ${hits.length}</span>`;
+  } else if (S.selBoard) {
+    $("cardsTitle").innerHTML = `板块「${S.selBoard}」 <span class="plan-count" id="poolCount" data-board-count>—</span>`;
+  } else {
+    $("cardsTitle").innerHTML = `今日达标 <span class="plan-count" id="poolCount">${S.loaded ? hits.length : ""}</span>`;
+  }
+  // A股：展示当前热门板块（可点击筛选）；接口限流则诚实提示
+  const hotEl = $("hotTopics");
+  if (!isCrypto) {
+    hotEl.style.display = "";
+    if (S.hot.length) {
+      hotEl.innerHTML = `<span style="color:var(--ink-faint)">热门板块：</span>` + S.hot.map(b =>
+        `<span class="hot-chip${S.selBoard === b.name ? ' sel' : ''}" data-board="${b.name}">${b.name}${b.chg1 > 0 ? ' <span class="h-chg ' + (b.chg1 > 0 ? 'up' : 'down') + '">' + b.chg1.toFixed(1) + '%</span>' : ''}</span>`
+      ).join("");
+    } else {
+      hotEl.innerHTML = `<span class="hot-chip" style="color:var(--ink-faint)">热门板块数据未获取（接口限流）</span>`;
+    }
+  } else {
+    hotEl.style.display = "none";
+  }
+  renderCards(rows);
+  renderCfg();
+}
+
+function renderCfg() {
+  if (!S.cfg) return;
+  $("autoCb").checked = !!S.cfg.auto;
+  $("autoTimes").textContent = (S.cfg.auto_times || ["11:30", "15:00"]).join(" / ");
+  // 市场 tab 状态
+  document.querySelectorAll("#marketTabs .tab").forEach(t => {
+    t.classList.toggle("on", t.dataset.market === S.market);
+  });
+}
+
+/* =============================== 达标卡片 =============================== */
+function renderCards(rows) {
+  const box = $("cards");
+  if (!S.loaded) {
+    box.innerHTML = Array(3).fill('<div class="skel-card"></div>').join("");
+    return;
+  }
+  const isCrypto = S.market === "crypto";
+  // 币圈：展示进池子全部标的（按涨跌幅降序），达标高亮
+  // A股：默认只展示达标；选中板块后展示该板块全部股票（按评分降序）
+  let shown;
+  if (isCrypto) {
+    shown = rows.slice().sort((a, b) => (b.chg || 0) - (a.chg || 0));
+  } else if (S.selBoard) {
+    shown = rows.filter(r => {
+      const c = (r.concepts || []).concat(r.hot_boards || []);
+      return c.some(n => n === S.selBoard || (n && S.selBoard && (n.includes(S.selBoard) || S.selBoard.includes(n))));
+    }).sort((a, b) => (b.score || 0) - (a.score || 0));
+    const cnt = document.querySelector("[data-board-count]");
+    if (cnt) cnt.textContent = shown.length;
+  } else {
+    shown = rows.filter(r => r.qualified);
+  }
+  if (!shown.length) {
+    box.innerHTML = `<div class="empty"><div class="big">NO SIGNAL</div><p>${S.selBoard ? `该板块暂无股票` : "暂无数据"}</p>
+      <button class="act go" type="button" onclick="doScan()">${isCrypto ? "币圈扫描" : "全市场扫描"}</button></div>`;
+    return;
+  }
+  box.innerHTML = shown.map((r, i) => cardHTML(r, i)).join("");
+  shown.forEach(r => loadChart(r.code));
+}
+
+function cardHTML(r, i) {
+  const isCrypto = S.market === "crypto";
+  const items = isCrypto
+    ? [
+        ["倍量", (r.volume_days || 0) + "日", r.volume_days >= 3 && r.volume_ratio >= 1.8],
+        ["试盘", (r.tests ?? 0) + "次", (r.tests || 0) >= 3],
+        ["24h", signOf(r.chg, "crypto") + "%", r.chg > 0],
+      ]
+    : [
+        ["热点", r.theme_ok ? "✓" : "—", r.theme_ok],
+        ["倍量", (r.volume_days || 0) + "日", r.volume_days >= 3 && r.volume_ratio >= 1.8],
+        ["流入", moneyW(r.fund_5d), r.fund_state === "流入"],
+        ["控盘", r.control || "—", r.control === "高"],
+        ["试盘", (r.tests ?? 0) + "次", (r.tests || 0) >= 3],
+      ];
+  const price = isCrypto ? fmtc(r.price) : fmt2(r.price);
+  const chgText = signOf(r.chg, S.market) + "%";
+  // 币圈达标标的加高亮描边 + 「达标」标记
+  const qBadge = (isCrypto && r.qualified) ? '<span class="q-badge">达标</span>' : "";
+  return `<article class="sig${(isCrypto && r.qualified) ? ' q' : ''}" data-code="${r.code}" data-market="${S.market}" style="animation-delay:${Math.min(i * 50, 400)}ms">
+    <div class="sig-top">
+      <div><div class="nm">${r.name}${qBadge}</div><div class="cd">${r.code}</div></div>
+      <div class="sig-top-right"><span class="px" data-px>${price}</span>
+        <span class="chg ${clsOf(r.chg)}" data-chg>${chgText}</span>
+        <span class="score-badge">${r.score}</span></div>
+    </div>
+    <div class="sig-chart"><canvas height="264" data-code="${r.code}" data-market="${S.market}"></canvas><div class="tip" data-code="${r.code}"></div></div>
+    <div class="sig-line">
+      ${items.map(([t, v, ok]) => ok
+        ? `<span><b>${t}</b> ${v}</span>`
+        : `<span class="no">${t} ${v}</span>`).join("")}
+      <span class="box">箱体 ${fmt2(r.box_low)}–${fmt2(r.box_high)}</span>
+    </div>
+  </article>`;
+}
+
+async function ensureK(code) {
+  const key = S.market + ":" + code;
+  if (S.kbars[key]) return S.kbars[key];
+  const d = await jfetch("api/kline?code=" + code + "&lmt=100&market=" + S.market).catch(() => null);
+  S.kbars[key] = d;
+  return d;
+}
+
+async function loadChart(code) {
+  const d = await ensureK(code);
+  if (!d || d.error || !(d.bars || []).length) return;
+  const cv = document.querySelector(`.sig[data-code="${code}"] .sig-chart canvas`);
+  if (cv) drawChart(cv, d);
+}
+
+function drawChart(cv, d) {
+  const code = cv.dataset.code;
+  const market = cv.dataset.market || "stock";
+  const isCrypto = market === "crypto";
+  const cssW = cv.clientWidth || 330, cssH = 264, dpr = window.devicePixelRatio || 1;
+  cv.width = cssW * dpr; cv.height = cssH * dpr;
+  const ctx = cv.getContext("2d"); ctx.scale(dpr, dpr);
+  const W = cssW, H = cssH, padL = 6, padR = 52, padT = 12, vh = Math.round(H * 0.68), volH = H - vh - 28;
+  const bars = d.bars || [];
+  if (!bars.length) return;
+  let lo = Infinity, hi = -Infinity, vmax = 0;
+  bars.forEach(b => { lo = Math.min(lo, b.low); hi = Math.max(hi, b.high); vmax = Math.max(vmax, b.vol); });
+  const span = (hi - lo) || 1e-9;
+  const n = bars.length, step = (W - padL - padR) / n, bw = Math.max(1, Math.min(8, step * 0.62));
+  const y = v => padT + (hi - v) / span * vh;
+  const box = d.box || {};
+  ctx.clearRect(0, 0, W, H);
+  ctx.font = "10px IBM Plex Mono, monospace";
+  ctx.lineWidth = 1;
+  const priceFmt = isCrypto ? (v => v >= 1 ? v.toFixed(2) : v.toPrecision(3)) : (v => v.toFixed(2));
+  for (let i = 0; i <= 4; i++) {
+    const yy = padT + i / 4 * vh, v = hi - i / 4 * span;
+    ctx.strokeStyle = "rgba(229,212,182,.07)"; ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke();
+    ctx.fillStyle = "rgba(229,212,182,.4)"; ctx.textAlign = "left"; ctx.fillText(priceFmt(v), W - padR + 6, yy + 3);
+  }
+  if (box.box_high != null) {
+    [[box.box_high, "#8FC98B"], [box.box_low, "rgba(229,212,182,.35)"]].forEach(([v, col]) => {
+      const yy = Math.max(padT, Math.min(padT + vh, y(v)));
+      ctx.save(); ctx.setLineDash([5, 4]); ctx.strokeStyle = col; ctx.beginPath();
+      ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke(); ctx.restore();
+      ctx.fillStyle = col; ctx.fillText(priceFmt(Number(v)), padL + 2, yy - 4);
+    });
+  }
+  bars.forEach((b, i) => {
+    const x = padL + i * step + step / 2, up = b.close >= b.open;
+    // A股涨红跌绿；币圈涨绿跌红（国际惯例）
+    const col = isCrypto ? (up ? "#4E9D63" : "#E2604F") : (up ? "#E2604F" : "#4E9D63");
+    ctx.strokeStyle = col; ctx.fillStyle = col;
+    const x0 = Math.max(padL, x - bw / 2), x1 = Math.min(W - padR, x + bw / 2);
+    const yO = y(b.open), yC = y(b.close);
+    ctx.beginPath(); ctx.moveTo(x, y(b.high)); ctx.lineTo(x, y(b.low)); ctx.stroke();
+    ctx.fillRect(x0, Math.min(yO, yC), Math.max(1, x1 - x0), Math.max(1, Math.abs(yC - yO)));
+    const vy = vh + 10 + (1 - b.vol / vmax) * volH;
+    ctx.globalAlpha = 0.35; ctx.fillRect(x0, vy, Math.max(1, x1 - x0), Math.max(1, vh + 10 + volH - vy)); ctx.globalAlpha = 1;
+  });
+  ctx.fillStyle = "rgba(229,212,182,.4)"; ctx.textAlign = "right";
+  ctx.fillText((vmax / 10000).toFixed(0) + "万手", W - padR, vh + 20);
+  ctx.strokeStyle = "rgba(229,212,182,.07)"; ctx.beginPath(); ctx.moveTo(padL, vh + 10); ctx.lineTo(W - padR, vh + 10); ctx.stroke();
+  ctx.textAlign = "center";
+  [0, Math.floor(n / 4), Math.floor(n / 2), Math.floor(n * 3 / 4), n - 1].forEach(i => {
+    ctx.fillStyle = "rgba(229,212,182,.4)"; ctx.fillText(bars[i].date.slice(5), padL + i * step + step / 2, H - 4);
+  });
+
+  const tip = document.querySelector(`.tip[data-code="${code}"]`);
+  if (!tip) return;
+  cv.onmousemove = ev => {
+    const rect = cv.getBoundingClientRect();
+    const i = Math.max(0, Math.min(n - 1, Math.floor((ev.clientX - rect.left - padL) / step)));
+    if (i < 0 || i >= n) return;
+    const b = bars[i];
+    tip.style.display = "block";
+    tip.style.left = Math.min(W - 190, ev.clientX - rect.left + 14) + "px";
+    tip.style.top = (ev.clientY - rect.top - 10) + "px";
+    tip.innerHTML = `<b>${b.date}</b><br>开 ${priceFmt(b.open)} · 高 ${priceFmt(b.high)}<br>` +
+      `低 ${priceFmt(b.low)} · 收 <b>${priceFmt(b.close)}</b> · 量 ${(b.vol / 10000).toFixed(1)}万`;
+  };
+  cv.onmouseleave = () => { tip.style.display = "none"; };
+}
+
+/* =============================== 行情自动刷新（3s） =============================== */
+async function refreshQuotes() {
+  if (!S.loaded) return;
+  const data = S.market === "crypto" ? (S.crypto || {}) : (S.watch || {});
+  const rows = data.candidates || [];
+  const codes = rows.filter(r => r.qualified).map(r => r.code);
+  if (!codes.length || S.market === "crypto") return;  // 币圈价格在扫描时已定格，3s 刷新仅 A股
+  try {
+    const qs = await jfetch("api/quotes?codes=" + codes.join(","));
+    codes.forEach(code => {
+      const q = qs[code];
+      if (!q) return;
+      const row = rows.find(r => r.code === code);
+      if (row) { row.price = q.price; row.chg = q.chg; }
+      const card = document.querySelector(`.sig[data-code="${code}"]`);
+      if (!card) return;
+      const px = card.querySelector("[data-px]");
+      const chg = card.querySelector("[data-chg]");
+      if (px) px.textContent = fmt2(q.price);
+      if (chg) { chg.textContent = sign(q.chg) + "%"; chg.className = "chg " + clsOf(q.chg); }
+    });
+  } catch (e) {}
+}
+
+/* =============================== 扫描 / 配置 =============================== */
+let scanning = false;
+async function doScan() {
+  if (scanning) return;
+  const mode = S.market === "crypto" ? "crypto" : "market";
+  scanning = true; $("btnScan").disabled = true; $("btnScan").textContent = "扫描中…";
+  try {
+    const r = await jfetch("api/scan", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }) });
+    if (r.status === "running") toast("扫描已在进行中");
+    for (let i = 0; i < 200; i++) {
+      await new Promise(res => setTimeout(res, 3000));
+      const st = await jfetch("api/status");
+      S.status = st;
+      if (!st.scanning) { await refresh(); toast("扫描完成"); break; }
+    }
+  } catch (e) {
+    toast("扫描失败");
+  }
+  scanning = false; $("btnScan").disabled = false; $("btnScan").textContent = S.market === "crypto" ? "币圈扫描" : "全市场扫描";
+}
+
+async function saveCfg() {
+  try {
+    const r = await jfetch("api/config", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auto: $("autoCb").checked }) });
+    S.cfg = r.config;
+    toast("已保存");
+  } catch (e) { toast("保存失败"); }
+}
+
+function switchMarket(market) {
+  if (S.market === market) return;
+  S.market = market;
+  S.kbars = {};
+  if (market === "crypto") S.selBoard = null;   // 板块筛选仅 A股
+  $("btnScan").textContent = market === "crypto" ? "币圈扫描" : "全市场扫描";
+  renderAll();
+  const data = market === "crypto" ? (S.crypto || {}) : (S.watch || {});
+  (data.candidates || []).filter(r => r.qualified).forEach(r => loadChart(r.code));
+}
+
+/* =============================== 启动 =============================== */
+function boot() {
+  if (location.protocol === "file:") {
+    $("cards").innerHTML = `<div class="empty"><div class="big">OFFLINE</div><p>python3 server.py → http://127.0.0.1:8808</p></div>`;
+    return;
+  }
+  document.querySelectorAll("#marketTabs .tab").forEach(t => {
+    t.addEventListener("click", () => switchMarket(t.dataset.market));
+  });
+  // 热门板块点击筛选
+  $("hotTopics").addEventListener("click", e => {
+    const chip = e.target.closest(".hot-chip[data-board]");
+    if (!chip) return;
+    const board = chip.dataset.board;
+    S.selBoard = (S.selBoard === board) ? null : board;
+    renderAll();
+  });
+  $("autoCb").addEventListener("change", () => saveCfg());
+  refresh().then(() => refreshQuotes());
+  setInterval(refreshQuotes, 3000);
+  setInterval(() => { if (!scanning) refresh().catch(() => {}); }, 300000);
+}
+boot();
+</script>
+</body>
+</html>
