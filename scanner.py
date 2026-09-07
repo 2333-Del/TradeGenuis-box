@@ -38,6 +38,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
+import resonance as rs
 
 try:
     import ths  # 同花顺第三数据源（d.10jqka.com.cn，无需 cookie）
@@ -621,12 +622,57 @@ def score_row(row: dict) -> dict:
     row["flag_pairs"] = flags
     row["mode"] = mode
     row["qualified"] = pts >= 85
-    return row
+    return rs.qualify(row)
 
 
 # --------------------------------------------------------------------------- #
 # 扫描主流程
 # --------------------------------------------------------------------------- #
+def fetch_stock_timeframes(code: str, as_of: datetime) -> dict:
+    """同源未复权分钟行情；不复用此前扫描缓存。"""
+    sym = tx_symbol(code)
+    error = None
+    for attempt in range(2):
+        try:
+            data = http_json(
+                f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={sym},m30,,{rs.LIMIT}")
+            node = data["data"][sym]
+            raw = node.get("m30") or []
+            if not raw:
+                raise ValueError("分钟行情为空")
+            quote_at = datetime.strptime(node["qt"][sym][30], "%Y%m%d%H%M%S").replace(tzinfo=BJT)
+            cutoff = as_of.astimezone(BJT)
+            if (cutoff - quote_at).total_seconds() > 7 * 86400:
+                raise ValueError("行情时间过旧")
+            if cutoff.weekday() < 5 and cutoff.strftime("%H:%M") >= "10:00" and quote_at.date() < cutoff.date():
+                raise ValueError("缺少当日行情（休市或停牌时不确认）")
+            frames = rs.snapshot(raw, cutoff)
+            reference = cutoff if cutoff.date() == quote_at.date() else min(cutoff, quote_at)
+            expected = [slot for slot in rs.SLOTS if slot <= reference.strftime("%H:%M")]
+            if expected:
+                latest = reference.strftime("%Y-%m-%d") + "T" + expected[-1]
+                if not frames["30m"]["bars"] or not frames["30m"]["bars"][-1]["date"].startswith(latest):
+                    raise ValueError("最新已收盘分钟行情缺失")
+            return frames
+        except Exception as exc:
+            error = exc
+    raise RuntimeError(f"分钟行情不可用: {error}")
+
+
+def apply_resonance(row: dict, as_of: datetime) -> dict:
+    row = dict(row, resonance_as_of=as_of.isoformat(), resonance_source="tencent_m30_unadjusted")
+    row["timeframes"] = {}
+    row["resonance_status"] = "未评估（原评分不足85）"
+    if row.get("base_qualified"):
+        try:
+            row["timeframes"] = fetch_stock_timeframes(row["code"], as_of)
+            row["resonance_status"] = "已评估"
+        except Exception as exc:
+            row["resonance_status"] = "数据不可用"
+            row["resonance_error"] = str(exc)[:180]
+    return rs.qualify(row)
+
+
 def load_pool() -> list[dict]:
     if POOL_FILE.exists():
         raw = json.loads(POOL_FILE.read_text(encoding="utf-8"))
@@ -645,7 +691,7 @@ def load_pool() -> list[dict]:
 
 
 def analyze(code: str, name: str, theme_hint: str,
-            hot_names: set[str]) -> dict:
+            hot_names: set[str], as_of: datetime | None = None) -> dict:
     """分析单只股票：拉全量数据 + 四条件计算。"""
     q = fetch_quote(code)
     bars = fetch_kline(code)
@@ -697,11 +743,12 @@ def analyze(code: str, name: str, theme_hint: str,
         "bar_date": bars[-1]["date"] if bars else "",
         "as_of_quote": now_str(),
     }
-    return score_row(row)
+    return apply_resonance(score_row(row), as_of or datetime.now(BJT))
 
 
 def run_scan(network: bool = True, progress=None) -> list[dict]:
     """执行扫描，写 data/watchlist.json，返回候选行。"""
+    as_of = datetime.now(BJT)
     pool = load_pool()
     hot_topics, hot_names = ([], set())
     if network:
@@ -714,7 +761,7 @@ def run_scan(network: bool = True, progress=None) -> list[dict]:
         if progress:
             progress(f"[{i + 1}/{len(pool)}] 分析 {s['code']} {s['name']}")
         try:
-            rows.append(analyze(s["code"], s["name"], s["theme"], hot_names))
+            rows.append(analyze(s["code"], s["name"], s["theme"], hot_names, as_of))
         except Exception as e:
             rows.append(score_row({
                 "code": s["code"], "name": s["name"] or s["code"],
@@ -723,6 +770,7 @@ def run_scan(network: bool = True, progress=None) -> list[dict]:
                 "box_low": None, "box_high": None, "tests": 0,
                 "fund_state": "无数据", "control": "—", "error": str(e)[:120],
                 "flags": [f"数据错误:{str(e)[:40]}", 0],
+                "resonance_status": "数据不可用", "timeframes": {},
             }))
         time.sleep(0.12)
 
@@ -959,7 +1007,7 @@ def _cached_holder(code: str) -> dict | None:
     return h
 
 
-def analyze_market(s: dict, hot_names: set[str]) -> dict | None:
+def analyze_market(s: dict, hot_names: set[str], as_of: datetime | None = None) -> dict | None:
     """对粗筛候选做全量四条件计算；数据不足返回 None（不占位）。"""
     try:
         bars = fetch_kline(s["code"])
@@ -999,7 +1047,7 @@ def analyze_market(s: dict, hot_names: set[str]) -> dict | None:
             "bar_date": bars[-1]["date"],
             "as_of_quote": now_str(),
         }
-        return score_row(row)
+        return apply_resonance(score_row(row), as_of or datetime.now(BJT))
     except Exception:
         return None
 
@@ -1029,6 +1077,7 @@ def run_market_scan(full: bool = True, top: int = MARKET_TOP,
     全市场扫描。full=True：沪深全部 A 股逐一深度计算（无粗筛）；
     full=False（快扫）：量比粗筛 TOP N 后深度计算。
     """
+    as_of = datetime.now(BJT)
     if progress:
         progress("拉取沪深 A 股全量清单（首次较慢，此后按日缓存）…")
     stocks = fetch_universe()
@@ -1052,7 +1101,7 @@ def run_market_scan(full: bool = True, top: int = MARKET_TOP,
     def one(s: dict):
         nonlocal done
         try:
-            return analyze_market(s, hot_names)
+            return analyze_market(s, hot_names, as_of)
         finally:
             with lock:
                 done += 1
@@ -1246,6 +1295,7 @@ def format_alert(rows: list[dict]) -> str:
         "条件: 热点题材 | 倍量≥3日 | 资金流入+控盘 | 试盘≥3次",
         "",
     ]
+    rows = [rs.qualify(r) for r in rows]
     hits = [r for r in rows if r.get("qualified")]
     watch = [r for r in rows if not r.get("qualified") and (r.get("score") or 0) >= 70]
 
@@ -1263,12 +1313,12 @@ def format_alert(rows: list[dict]) -> str:
         lines.append("本日无达标/观察标的。")
     else:
         if hits:
-            lines.append("【达标 ≥85】")
+            lines.append("【达标（A股：≥85且三周期共振）】")
             for r in hits:
                 lines += item(r)
             lines.append("")
         if watch:
-            lines.append("【观察 70-84】")
+            lines.append("【观察（未达标且评分≥70）】")
             for r in watch:
                 lines += item(r)
     lines += ["", "超短线战法，注意仓位与假突破。非投资建议。"]
@@ -1315,6 +1365,7 @@ def print_table(rows: list[dict]) -> None:
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
+        r = rs.qualify(r)
         chg = cv(r.get("chg"), "{:+.2f}")
         box = f"{cv(r.get('box_low'), '{:.2f}')}–{cv(r.get('box_high'), '{:.2f}')}"
         print(
@@ -1363,7 +1414,7 @@ def main() -> int:
         }
         rows = [score_row(c) for c in raw.get("candidates", [])]
         payload = dict(raw)
-        payload["as_of"] = now_str()
+        payload["rescored_at"] = now_str()
         payload["candidates"] = rows
         WATCH_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     elif args.crypto:

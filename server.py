@@ -174,9 +174,20 @@ def get_quotes(codes: list[str]) -> dict:
     return out
 
 
-def get_kline(code: str, lmt: int = 160, market: str = "stock") -> dict | None:
+def get_kline(code: str, lmt: int = 160, market: str = "stock", interval: str = "1d") -> dict | None:
+    if interval not in sc.rs.PERIODS or (market == "crypto" and interval != "1d"):
+        return {"error": "unsupported interval"}
+    if market == "stock":
+        rows = read_json(WATCH_FILE, {}).get("candidates", [])
+        row = next((r for r in rows if r.get("code") == code), {})
+        frame = row.get("timeframes", {}).get(interval)
+        if not frame:
+            return {"code": code, "error": row.get("resonance_status", "待重新扫描")}
+        return {"code": code, "name": row.get("name", code), "interval": interval,
+                "bars": frame.get("bars", []), "box": {k: v for k, v in frame.items() if k != "bars"},
+                "as_of": row.get("resonance_as_of"), "price": row.get("price")}
     with LOCK:
-        cached = STATE["kline_cache"].get(("k", market, code))
+        cached = STATE["kline_cache"].get(("k", market, code, interval))
         if cached and time.time() - cached[0] < CACHE_TTL:
             return cached[1]
     try:
@@ -188,18 +199,8 @@ def get_kline(code: str, lmt: int = 160, market: str = "stock") -> dict | None:
                 "chg": None, "turnover": None, "volume_ratio": None,
                 "bar_date": bars[-1]["date"], "bars": bars, "box": box,
             }
-        else:
-            quote = sc.fetch_quote(code)
-            bars = sc.fetch_kline(code, lmt=lmt)
-            box = sc.compute_box(bars)
-            payload = {
-                "code": code, "name": quote.get("name", ""),
-                "price": quote["price"], "chg": quote["chg"],
-                "turnover": quote["turnover"], "volume_ratio": quote["volume_ratio"],
-                "bar_date": bars[-1]["date"], "bars": bars, "box": box,
-            }
         with LOCK:
-            STATE["kline_cache"][("k", market, code)] = (time.time(), payload)
+            STATE["kline_cache"][("k", market, code, interval)] = (time.time(), payload)
         return payload
     except Exception as e:
         return {"code": code, "error": str(e)[:150]}
@@ -262,7 +263,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json({"error": "not found"}, 404)
         elif p == "/api/watchlist":
-            self._json(read_json(WATCH_FILE, {"as_of": None, "candidates": []}))
+            payload = read_json(WATCH_FILE, {"as_of": None, "candidates": []})
+            payload["candidates"] = [sc.rs.qualify(r) for r in payload.get("candidates", [])]
+            self._json(payload)
         elif p == "/api/crypto":
             self._json(read_json(sc.CRYPTO_FILE, {"as_of": None, "candidates": []}))
         elif p == "/api/hot":
@@ -296,7 +299,11 @@ class Handler(BaseHTTPRequestHandler):
                 lmt = min(500, max(60, int(q.get("lmt", 160))))
             except ValueError:
                 pass
-            self._json(get_kline(code, lmt, market))
+            interval = q.get("interval", "1d")
+            if interval not in sc.rs.PERIODS or (market == "crypto" and interval != "1d"):
+                self._json({"error": "unsupported interval"}, 400)
+                return
+            self._json(get_kline(code, lmt, market, interval))
         else:
             self._json({"error": "not found"}, 404)
 

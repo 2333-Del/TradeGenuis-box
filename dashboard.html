@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="description" content="TradeGenuis 箱体突破：四条件全市场自动扫描，达标标的实时呈现。" />
+  <meta name="description" content="TradeGenuis 箱体突破：A股原评分与30m/1h/1d箱体突破共振双门槛筛选。" />
   <title>TradeGenuis · 箱体突破</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231C223A'/%3E%3Crect x='14' y='26' width='28' height='24' rx='3' fill='none' stroke='%239BD597' stroke-width='4'/%3E%3Cpath d='M38 18 L50 18 L50 30 M50 18 L38 30' stroke='%239BD597' stroke-width='4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
   <style>
@@ -108,6 +108,8 @@
     .sec-head h3 { font-size: 14px; font-weight: 700; }
     .plan-count { font-family: var(--num); font-size: 12px; color: var(--up); background: rgba(155,213,151,.12); border-radius: 999px; padding: 1px 9px; }
 
+    .resonance select { background: #1C223A; color: #E5D4B6; border: 1px solid #596078; border-radius: 5px; padding: 3px 8px; }
+    .resonance [data-confirm] { flex-basis: 100%; font-size: 11px; overflow-wrap: anywhere; }
     /* 达标卡片 */
     .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 10px; }
     .sig { background: var(--card); border: 1px solid var(--card-border); border-radius: var(--r); padding: 12px 14px 10px; animation: rise .45s cubic-bezier(.2,.7,.3,1) both; }
@@ -185,6 +187,8 @@
 
 <script>
 "use strict";
+const periods = ["30m", "1h", "1d"];
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;", "'":"&#39;"}[c]));
 const S = { watch: null, crypto: null, status: null, cfg: null, hot: [], loaded: false, kbars: {}, market: "stock", selBoard: null };
 const $ = id => document.getElementById(id);
 const fmt2 = v => (v === null || v === undefined || isNaN(v)) ? "—" : Number(v).toFixed(2);
@@ -217,6 +221,7 @@ async function loadAll() {
     jfetch("api/config").catch(() => null),
     jfetch("api/hot").catch(() => ({ hot_topics: [] })),
   ]);
+  S.kbars = {};
   S.watch = w; S.crypto = c; S.status = st; S.cfg = cfg; S.hot = hot.hot_topics || []; S.loaded = true;
   renderAll();
 }
@@ -241,7 +246,7 @@ function renderAll() {
   } else if (S.selBoard) {
     $("cardsTitle").innerHTML = `板块「${S.selBoard}」 <span class="plan-count" id="poolCount" data-board-count>—</span>`;
   } else {
-    $("cardsTitle").innerHTML = `今日达标 <span class="plan-count" id="poolCount">${S.loaded ? hits.length : ""}</span>`;
+    $("cardsTitle").innerHTML = `A股共振达标 <span class="plan-count" id="poolCount">${S.loaded ? hits.length : ""}</span>`;
   }
   // A股：展示当前热门板块（可点击筛选）；接口限流则诚实提示
   const hotEl = $("hotTopics");
@@ -295,7 +300,7 @@ function renderCards(rows) {
     shown = rows.filter(r => r.qualified);
   }
   if (!shown.length) {
-    box.innerHTML = `<div class="empty"><div class="big">NO SIGNAL</div><p>${S.selBoard ? `该板块暂无股票` : "暂无数据"}</p>
+    box.innerHTML = `<div class="empty"><div class="big">NO SIGNAL</div><p>${S.selBoard ? `该板块暂无股票` : isCrypto ? "暂无数据" : rows.some(r => r.resonance_status === "数据不可用") ? "行情获取失败，暂无已确认共振标的" : rows.some(r => !r.resonance_status) ? "待重新扫描：旧结果尚未评估共振" : "暂无多周期共振标的"}</p>
       <button class="act go" type="button" onclick="doScan()">${isCrypto ? "币圈扫描" : "全市场扫描"}</button></div>`;
     return;
   }
@@ -320,38 +325,55 @@ function cardHTML(r, i) {
       ];
   const price = isCrypto ? fmtc(r.price) : fmt2(r.price);
   const chgText = signOf(r.chg, S.market) + "%";
-  // 币圈达标标的加高亮描边 + 「达标」标记
-  const qBadge = (isCrypto && r.qualified) ? '<span class="q-badge">达标</span>' : "";
-  return `<article class="sig${(isCrypto && r.qualified) ? ' q' : ''}" data-code="${r.code}" data-market="${S.market}" style="animation-delay:${Math.min(i * 50, 400)}ms">
+  // 达标标的加高亮描边 + 「达标」标记
+  const qBadge = (r.qualified) ? '<span class="q-badge">达标</span>' : "";
+  return `<article class="sig${r.qualified ? ' q' : ''}" data-code="${r.code}" data-market="${S.market}" style="animation-delay:${Math.min(i * 50, 400)}ms">
     <div class="sig-top">
       <div><div class="nm">${r.name}${qBadge}</div><div class="cd">${r.code}</div></div>
       <div class="sig-top-right"><span class="px" data-px>${price}</span>
         <span class="chg ${clsOf(r.chg)}" data-chg>${chgText}</span>
-        <span class="score-badge">${r.score}</span></div>
+        <span class="score-badge" title="原策略评分；A股还须三周期共振">${r.score}</span></div>
     </div>
+    ${!isCrypto ? `<div class="sig-line resonance">
+      <b>共振 ${periods.filter(p => r.timeframes?.[p]?.ok).length}/3</b>
+      ${periods.map(p => `<span class="${r.timeframes?.[p]?.ok ? '' : 'no'}">${p} · ${esc(r.timeframes?.[p]?.reason || r.resonance_status || '待重新扫描')}</span>`).join('')}
+      <label>图表 <select aria-label="K线周期" onchange="loadChart('${r.code}', this.value)">${periods.map(p => `<option value="${p}" ${p === '1d' ? 'selected' : ''}>${p}</option>`).join('')}</select></label>
+      <span data-confirm></span></div>` : ''}
     <div class="sig-chart"><canvas height="264" data-code="${r.code}" data-market="${S.market}"></canvas><div class="tip" data-code="${r.code}"></div></div>
     <div class="sig-line">
       ${items.map(([t, v, ok]) => ok
         ? `<span><b>${t}</b> ${v}</span>`
         : `<span class="no">${t} ${v}</span>`).join("")}
-      <span class="box">箱体 ${fmt2(r.box_low)}–${fmt2(r.box_high)}</span>
+      <span class="box">${isCrypto ? "箱体" : "原评分日线箱体"} ${fmt2(r.box_low)}–${fmt2(r.box_high)}</span>
     </div>
   </article>`;
 }
 
-async function ensureK(code) {
-  const key = S.market + ":" + code;
+async function ensureK(code, interval, market) {
+  const key = market + ":" + code + ":" + interval;
   if (S.kbars[key]) return S.kbars[key];
-  const d = await jfetch("api/kline?code=" + code + "&lmt=100&market=" + S.market).catch(() => null);
-  S.kbars[key] = d;
+  const d = await jfetch("api/kline?code=" + code + "&lmt=100&market=" + market + "&interval=" + interval).catch(() => null);
+  if (d && !d.error) S.kbars[key] = d;
   return d;
 }
 
-async function loadChart(code) {
-  const d = await ensureK(code);
-  if (!d || d.error || !(d.bars || []).length) return;
-  const cv = document.querySelector(`.sig[data-code="${code}"] .sig-chart canvas`);
-  if (cv) drawChart(cv, d);
+async function loadChart(code, interval) {
+  const market = S.market;
+  const card = document.querySelector(`.sig[data-code="${code}"][data-market="${market}"]`);
+  if (!card) return;
+  interval = interval || card.querySelector('select')?.value || "1d";
+  card.dataset.interval = interval;
+  const d = await ensureK(code, interval, market);
+  if (!card.isConnected || card.dataset.interval !== interval) return;
+  const cv = card.querySelector('canvas');
+  const status = card.querySelector('[data-confirm]');
+  if (!d || d.error || !d.bars?.length) {
+    cv.getContext('2d').clearRect(0, 0, cv.width, cv.height);
+    if (status) status.textContent = d?.error || '图表数据不可用';
+    return;
+  }
+  if (status) status.textContent = `突破：${d.box?.breakout_at || '—'} · 确认至：${d.box?.confirmed_at || '—'}`;
+  drawChart(cv, d);
 }
 
 function drawChart(cv, d) {
@@ -362,7 +384,7 @@ function drawChart(cv, d) {
   cv.width = cssW * dpr; cv.height = cssH * dpr;
   const ctx = cv.getContext("2d"); ctx.scale(dpr, dpr);
   const W = cssW, H = cssH, padL = 6, padR = 52, padT = 12, vh = Math.round(H * 0.68), volH = H - vh - 28;
-  const bars = d.bars || [];
+  const bars = (d.bars || []).slice(-100);
   if (!bars.length) return;
   let lo = Infinity, hi = -Infinity, vmax = 0;
   bars.forEach(b => { lo = Math.min(lo, b.low); hi = Math.max(hi, b.high); vmax = Math.max(vmax, b.vol); });
@@ -396,15 +418,24 @@ function drawChart(cv, d) {
     const yO = y(b.open), yC = y(b.close);
     ctx.beginPath(); ctx.moveTo(x, y(b.high)); ctx.lineTo(x, y(b.low)); ctx.stroke();
     ctx.fillRect(x0, Math.min(yO, yC), Math.max(1, x1 - x0), Math.max(1, Math.abs(yC - yO)));
-    const vy = vh + 10 + (1 - b.vol / vmax) * volH;
+    const vy = vh + 10 + (1 - b.vol / (vmax || 1)) * volH;
     ctx.globalAlpha = 0.35; ctx.fillRect(x0, vy, Math.max(1, x1 - x0), Math.max(1, vh + 10 + volH - vy)); ctx.globalAlpha = 1;
   });
+  if (box.breakout_at) {
+    const i = bars.findIndex(b => b.date === box.breakout_at);
+    if (i >= 0) {
+      const x = padL + i * step + step / 2;
+      ctx.save(); ctx.strokeStyle = "#8FC98B"; ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, vh); ctx.stroke(); ctx.restore();
+      ctx.fillStyle = "#8FC98B"; ctx.fillText("突破", Math.min(x, W - padR - 26), padT + 10);
+    }
+  }
   ctx.fillStyle = "rgba(229,212,182,.4)"; ctx.textAlign = "right";
   ctx.fillText((vmax / 10000).toFixed(0) + "万手", W - padR, vh + 20);
   ctx.strokeStyle = "rgba(229,212,182,.07)"; ctx.beginPath(); ctx.moveTo(padL, vh + 10); ctx.lineTo(W - padR, vh + 10); ctx.stroke();
   ctx.textAlign = "center";
   [0, Math.floor(n / 4), Math.floor(n / 2), Math.floor(n * 3 / 4), n - 1].forEach(i => {
-    ctx.fillStyle = "rgba(229,212,182,.4)"; ctx.fillText(bars[i].date.slice(5), padL + i * step + step / 2, H - 4);
+    ctx.fillStyle = "rgba(229,212,182,.4)"; ctx.fillText(bars[i].date.slice(5, 10) + (d.interval && d.interval !== "1d" ? " " + bars[i].date.slice(11,16) : ""), padL + i * step + step / 2, H - 4);
   });
 
   const tip = document.querySelector(`.tip[data-code="${code}"]`);
