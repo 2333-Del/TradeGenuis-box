@@ -62,6 +62,35 @@ class RuleTests(unittest.TestCase):
         bars = [dict(date=str(i), open=100, close=100, high=100, low=100, vol=1) for i in range(63)]
         self.assertFalse(rs.evaluate(bars)['ok'])
 
+    def test_near_state_when_pressing_the_top(self):
+        # 贴近上沿未突破：距箱顶 -0.5%、箱内位置 95% → NEAR 而非直接出局
+        result = rs.evaluate(candles([99, 99.5, 99.5]))
+        self.assertEqual(result['state'], 'NEAR')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['dist_pct'], -0.5)
+
+    def test_standing_above_box_is_break(self):
+        # 首次上穿滑出窗口后持续站稳（近3根低点不破老箱体）→ BREAK
+        bars = [dict(date=str(i), open=99, close=99, high=100, low=90, vol=1) for i in range(60)]
+        for j, c in enumerate((103, 104, 105, 106)):
+            bars.append(dict(date=str(60 + j), open=c, close=c, high=c * 1.005,
+                             low=c * 0.998, vol=1))
+        result = rs.evaluate(bars)
+        self.assertEqual(result['state'], 'BREAK')
+        self.assertEqual(result['reason'], '站稳箱顶')
+        # 比较窗口混入首根高位K（突破已久之常态），箱顶为站稳平台的高点
+        self.assertAlmostEqual(result['box_high'], 103.515, places=2)
+
+    def test_period_specific_recent_window(self):
+        # 1d 用宽窗口（RECENT['1d']=10）：10 根内的突破仍算 BREAK，14 根前的不算
+        closes = [99] * 49 + [101] + [99] * 14      # 突破发生在倒数第 15 根
+        self.assertNotEqual(rs.evaluate(candles(closes), rs.RECENT['1d'])['state'], 'BREAK')
+        closes = [99] * 53 + [101] + [99] * 9       # 突破发生在倒数第 10 根
+        result = rs.evaluate(candles(closes), rs.RECENT['1d'])
+        self.assertNotEqual(result['state'], 'BREAK')  # 突破后跌回，非维持
+        closes = [99] * 53 + [101] + [101.5] * 9
+        self.assertEqual(rs.evaluate(candles(closes), rs.RECENT['1d'])['state'], 'BREAK')
+
 
 class AggregationTests(unittest.TestCase):
     def test_session_aggregation(self):
@@ -96,15 +125,49 @@ class AggregationTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
-    def frames(self):
-        return {p: dict(rs.evaluate(candles([101,102,103])), bars=candles([101,102,103])) for p in rs.PERIODS}
+    def frames(self, states=None):
+        base = dict(rs.evaluate(candles([101, 102, 103])), bars=candles([101, 102, 103]))
+        return {p: (dict(base, state=states[p]) if states else dict(base)) for p in rs.PERIODS}
 
-    def test_double_gate_and_partial(self):
+    def test_resonance_grading(self):
+        # 强共振不再被评分一票否决；准共振需评分≥70；临界池只跟踪不达标
+        frames = self.frames()   # 三周期 BREAK
+        for score in (50, 84, 100):
+            row = rs.qualify(dict(score=score, timeframes=frames, resonance_status='已评估'))
+            self.assertTrue(row['qualified'], score)
+            self.assertEqual(row['mode'], '强共振达标')
+        frames = self.frames(states={'30m': 'BREAK', '1h': 'INSIDE', '1d': 'NEAR'})
+        row = rs.qualify(dict(score=75, timeframes=frames, resonance_status='已评估'))
+        self.assertEqual(row['resonance_level'], 'soft')
+        self.assertTrue(row['qualified'])
+        row = rs.qualify(dict(score=50, timeframes=frames, resonance_status='已评估'))
+        self.assertFalse(row['qualified'])
+        self.assertEqual(row['mode'], '准共振·评分不足')
+        frames = self.frames(states={'30m': 'INSIDE', '1h': 'INSIDE', '1d': 'NEAR'})
+        row = rs.qualify(dict(score=90, timeframes=frames, resonance_status='已评估'))
+        self.assertEqual(row['resonance_level'], 'near')
+        self.assertFalse(row['qualified'])
+        self.assertEqual(row['mode'], '临界跟踪')
+
+    def test_stale_breakout_downgrades_from_strong(self):
+        # 三周期 BREAK 但 1d 距箱顶 15%（突破已久）→ 趋势延续，降为准共振
         frames = self.frames()
-        for score, expected in ((84,False),(85,True),(100,True)):
-            self.assertEqual(rs.qualify(dict(score=score,timeframes=frames))['qualified'],expected)
-        frames['1h']['ok'] = False
-        self.assertFalse(rs.qualify(dict(score=100,timeframes=frames))['qualified'])
+        frames['1d']['dist_pct'] = 15.0
+        row = rs.qualify(dict(score=80, timeframes=frames, resonance_status='已评估'))
+        self.assertEqual(row['resonance_level'], 'soft')
+        self.assertTrue(row['qualified'])
+
+    def test_etf_score_blends_resonance(self):
+        frames = self.frames(states={'30m': 'BREAK', '1h': 'BREAK', '1d': 'BREAK'})
+        row = rs.qualify(dict(market='etf', base_score=35, score=35, timeframes=frames,
+                              resonance_status='已评估'))
+        self.assertEqual(row['score'], 85)      # 35 + strong 50
+        self.assertTrue(row['qualified'])
+        self.assertEqual(rs.qualify(row)['score'], 85)   # 重复调用幂等
+        frames = self.frames(states={'30m': 'INSIDE', '1h': 'INSIDE', '1d': 'BELOW'})
+        row = rs.qualify(dict(market='etf', base_score=50, score=50, timeframes=frames,
+                              resonance_status='已评估'))
+        self.assertEqual(row['score'], 50)      # none 不加分
 
     def test_old_result_and_crypto_unchanged(self):
         old = rs.qualify(dict(score=100, qualified=True))
@@ -114,13 +177,13 @@ class IntegrationTests(unittest.TestCase):
         crypto = sc.score_row(dict(market='crypto',volume_days=3,volume_ratio=2,tests=3,chg=12))
         self.assertTrue(crypto['qualified']); self.assertEqual(crypto['score'],100)
 
-    def test_skip_and_failure(self):
-        with patch.object(sc,'fetch_stock_timeframes') as fetch:
-            result = sc.apply_resonance(dict(score=84,base_qualified=False),NOW)
-            fetch.assert_not_called(); self.assertFalse(result['qualified'])
-            fetch.side_effect = RuntimeError('offline')
-            result = sc.apply_resonance(dict(code='600519',score=100,base_qualified=True),NOW)
-            self.assertFalse(result['qualified']); self.assertEqual(result['resonance_status'],'数据不可用')
+    def test_every_row_gets_resonance(self):
+        # 共振是主筛：低分行也要评估（不再按 base_qualified 跳过）
+        with patch.object(sc,'fetch_stock_timeframes',side_effect=RuntimeError('offline')) as fetch:
+            result = sc.apply_resonance(dict(code='600519',score=40,base_qualified=False),NOW)
+            self.assertEqual(fetch.call_count, 1)
+            self.assertFalse(result['qualified'])
+            self.assertEqual(result['resonance_status'],'数据不可用')
 
     def test_chart_snapshot_and_period_isolation(self):
         frames = self.frames(); frames['30m']['bars'][0]['close'] = 98
@@ -148,7 +211,8 @@ class IntegrationTests(unittest.TestCase):
             stack.enter_context(patch.object(sc, 'WATCH_FILE', Path(temp)/'watch.json'))
             stack.enter_context(patch.object(sc, 'load_pool', return_value=[stock,dict(stock,code='000001')]))
             stack.enter_context(patch.object(sc, 'fetch_universe', return_value=[stock,dict(stock,code='000001')]))
-            stack.enter_context(patch.object(sc, 'screen_universe', side_effect=lambda stocks,*_: stocks))
+            stack.enter_context(patch.object(sc, 'screen_universe', side_effect=lambda stocks,*_,**__: stocks))
+            stack.enter_context(patch.object(sc, 'fetch_etf_universe', return_value=[]))
             stack.enter_context(patch.object(sc, 'fetch_hot_topics', return_value=([],set())))
             stack.enter_context(patch.object(sc, '_mkt_cache_save'))
             analyze = stack.enter_context(patch.object(sc,'analyze',return_value=dict(score=0,qualified=False)))
@@ -172,7 +236,7 @@ class IntegrationTests(unittest.TestCase):
                 stack.enter_context(patch.object(sc,name,return_value=None))
             for name in ('fetch_concepts','_cached_concepts'):
                 stack.enter_context(patch.object(sc,name,return_value=[]))
-            gate = stack.enter_context(patch.object(sc,'apply_resonance',side_effect=lambda row,cutoff: row))
+            gate = stack.enter_context(patch.object(sc,'apply_resonance',side_effect=lambda row,cutoff,**kw: row))
             sc.analyze('600519','test','',set(),NOW)
             sc.analyze_market(dict(code='600519',name='test',price=101,chg=1,turnover=1,vr=2),set(),NOW)
             self.assertEqual(gate.call_count,2)

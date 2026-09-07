@@ -119,7 +119,7 @@ def is_trading_time() -> bool:
 def tx_symbol(code: str) -> str:
     if code.startswith(("6", "9", "5")):
         return f"sh{code}"
-    if code.startswith(("0", "3")):
+    if code.startswith(("0", "3", "1")):   # 1 开头含深市场内基金（15/16/18）
         return f"sz{code}"
     return f"bj{code}"
 
@@ -628,8 +628,10 @@ def score_row(row: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # 扫描主流程
 # --------------------------------------------------------------------------- #
-def fetch_stock_timeframes(code: str, as_of: datetime) -> dict:
-    """同源未复权分钟行情；不复用此前扫描缓存。"""
+def fetch_stock_timeframes(code: str, as_of: datetime,
+                           daily_bars: list[dict] | None = None) -> dict:
+    """30m/1h 用同源未复权分钟行情；1d 优先用日K（mkline 历史深度会被截断，
+    聚合日线凑不满箱体窗口，日K才是稳定口径）。不复用此前扫描缓存。"""
     sym = tx_symbol(code)
     error = None
     for attempt in range(2):
@@ -647,6 +649,8 @@ def fetch_stock_timeframes(code: str, as_of: datetime) -> dict:
             if cutoff.weekday() < 5 and cutoff.strftime("%H:%M") >= "10:00" and quote_at.date() < cutoff.date():
                 raise ValueError("缺少当日行情（休市或停牌时不确认）")
             frames = rs.snapshot(raw, cutoff)
+            if daily_bars and len(daily_bars) >= rs.LOOKBACK + rs.RECENT["1d"]:
+                frames["1d"] = dict(rs.evaluate(daily_bars, rs.RECENT["1d"]), bars=daily_bars)
             reference = cutoff if cutoff.date() == quote_at.date() else min(cutoff, quote_at)
             expected = [slot for slot in rs.SLOTS if slot <= reference.strftime("%H:%M")]
             if expected:
@@ -659,17 +663,17 @@ def fetch_stock_timeframes(code: str, as_of: datetime) -> dict:
     raise RuntimeError(f"分钟行情不可用: {error}")
 
 
-def apply_resonance(row: dict, as_of: datetime) -> dict:
+def apply_resonance(row: dict, as_of: datetime,
+                    daily_bars: list[dict] | None = None) -> dict:
+    """共振是主筛：池内全体评估（评分只是质量排序，不再 gate 共振评估）。"""
     row = dict(row, resonance_as_of=as_of.isoformat(), resonance_source="tencent_m30_unadjusted")
     row["timeframes"] = {}
-    row["resonance_status"] = "未评估（原评分不足85）"
-    if row.get("base_qualified"):
-        try:
-            row["timeframes"] = fetch_stock_timeframes(row["code"], as_of)
-            row["resonance_status"] = "已评估"
-        except Exception as exc:
-            row["resonance_status"] = "数据不可用"
-            row["resonance_error"] = str(exc)[:180]
+    row["resonance_status"] = "数据不可用"
+    try:
+        row["timeframes"] = fetch_stock_timeframes(row["code"], as_of, daily_bars)
+        row["resonance_status"] = "已评估"
+    except Exception as exc:
+        row["resonance_error"] = str(exc)[:180]
     return rs.qualify(row)
 
 
@@ -743,7 +747,7 @@ def analyze(code: str, name: str, theme_hint: str,
         "bar_date": bars[-1]["date"] if bars else "",
         "as_of_quote": now_str(),
     }
-    return apply_resonance(score_row(row), as_of or datetime.now(BJT))
+    return apply_resonance(score_row(row), as_of or datetime.now(BJT), daily_bars=bars)
 
 
 def run_scan(network: bool = True, progress=None) -> list[dict]:
@@ -794,10 +798,17 @@ def run_scan(network: bool = True, progress=None) -> list[dict]:
 # --------------------------------------------------------------------------- #
 UNIVERSE_FILE = DATA / "universe.json"
 MKT_CACHE_FILE = DATA / "mkt_cache.json"
+ETF_UNIVERSE_FILE = DATA / "etf_universe.json"
 UNIVERSE_FS = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"   # 深主板A+创业板+沪主板A+科创板
+ETF_FS = "b:MK0021,b:MK0022"       # 东财场内 ETF（沪+深，实测 1300+ 只）
+ETF_AMT_MIN = 3e7                  # ETF 活跃门槛：成交额 ≥ 3000 万元
 MARKET_TOP = 200       # 默认深度计算候选数
 MARKET_WORKERS = 8     # 并发
-SCREEN_VR = 1.2        # 粗筛：量比 ≥ 1.2 且当日上涨未涨停
+ACTIVE_CHG = 2.0       # 活跃池：当日涨幅下限
+ACTIVE_TURNOVER = 2.0  # 活跃池：换手率下限
+ACTIVE_VR = 1.2        # 活跃池：量比下限（东财量比字段缺失时自动失效）
+SAVE_MIN_SCORE = 60    # 落盘行下限：评分≥60 或共振有信号
+SAVE_BARS = {"30m": 68, "1h": 70, "1d": 72}   # 落盘每周期尾部K线数（覆盖箱体窗口+确认期，画图够用）
 CACHE_LOCK = threading.Lock()
 _mkt_cache: dict | None = None
 
@@ -944,24 +955,24 @@ def _universe_sina() -> list[dict] | None:
         return None
 
 
-def screen_universe(stocks: list[dict], top: int, pool_codes: set[str]) -> list[dict]:
+def screen_universe(stocks: list[dict], top: int | None = None,
+                    pool_codes: set[str] = set()) -> list[dict]:
     """
-    粗筛（当日活跃度）。量比可用时按量比排名；否则按 涨幅+换手 强度排名。
-    池内标的保送。
+    活跃池粗筛（共振主筛的前置漏斗）：换手≥2% 或 涨幅≥2% 或 量比≥1.2，
+    剔除涨停（无法接力）与低价股；自选池保送。top=None 时不限量。
     """
-    base = [s for s in stocks if 0 < s["chg"] < 9.8 and s["price"] > 2]
-    has_vr = sum(1 for s in stocks if s["vr"] > 0.05) > 500
-    if has_vr:
-        cands = [s for s in base if s["vr"] >= SCREEN_VR]
-        cands.sort(key=lambda s: (s["vr"], s["chg"]), reverse=True)
-    else:
-        cands = [s for s in base if 1.5 <= s["turnover"] <= 30]
-        cands.sort(key=lambda s: (s["chg"] + min(s["turnover"], 20) * 0.12,
-                                  s["amount"]), reverse=True)
-    picked = cands[:top]
+    def active(s):
+        if s["price"] <= 2 or not 0 < s["chg"] < 9.8:
+            return False
+        return (s["chg"] >= ACTIVE_CHG or s["turnover"] >= ACTIVE_TURNOVER
+                or s.get("vr", 0) >= ACTIVE_VR)
+
+    cands = [s for s in stocks if active(s)]
+    cands.sort(key=lambda s: (s.get("vr", 0), s["chg"], s["turnover"]), reverse=True)
+    picked = cands if not top else cands[:top]
     have = {s["code"] for s in picked}
     for s in stocks:                     # 自选池保送
-        if s["code"] in pool_codes and s["code"] not in have:
+        if s["code"] in pool_codes and s["code"] not in have and s["price"] > 0:
             picked.append(s)
             have.add(s["code"])
     return picked
@@ -1007,6 +1018,130 @@ def _cached_holder(code: str) -> dict | None:
     return h
 
 
+def fetch_etf_universe(force: bool = False) -> list[dict]:
+    """场内 ETF 列表（东财 clist 沪+深，含量价与成交额），按日缓存；失败返回空列表。"""
+    today = datetime.now(BJT).strftime("%Y-%m-%d")
+    if not force and ETF_UNIVERSE_FILE.exists():
+        try:
+            d = json.loads(ETF_UNIVERSE_FILE.read_text(encoding="utf-8"))
+            if d.get("as_of") == today and d.get("etfs"):
+                return d["etfs"]
+        except Exception:
+            pass
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def page(pn: int) -> dict:
+        params = {
+            "pn": pn, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+            "ut": em.EM_UT, "fid": "f12", "fs": ETF_FS,
+            "fields": "f2,f3,f6,f12,f14",
+        }
+        try:
+            return (em.get_json(em.PUSH2, "/api/qt/clist/get", params, timeout=12)
+                    or {}).get("data") or {}
+        except Exception:
+            pass
+        # 编号镜像对该路径间歇性重置连接；主域直连兜底
+        try:
+            r = HTTP.get("https://push2.eastmoney.com/api/qt/clist/get",
+                         params=params, timeout=12)
+            return (r.json() or {}).get("data") or {}
+        except Exception:
+            return {}
+
+    etfs: list[dict] = []
+    try:
+        pn = 1
+        while True:
+            if pn > 1:
+                time.sleep(0.4)               # 分页节流，防路径级限流
+            d = page(pn)
+            total = d.get("total") or 0
+            for b in d.get("diff") or []:
+                name = str(b.get("f14") or "").strip()
+                px = _f(b.get("f2"))
+                if not name or px <= 0:
+                    continue
+                etfs.append({
+                    "code": str(b["f12"]), "name": name, "price": px,
+                    "chg": _f(b.get("f3")), "amount": _f(b.get("f6")),  # 成交额（元）
+                    "vr": 0.0, "turnover": 0.0, "mv": 0.0,
+                })
+            if not total or not d.get("diff") or pn * 100 >= total or pn > 30:
+                break
+            pn += 1
+    except Exception:
+        etfs = []
+    if etfs:
+        try:
+            DATA.mkdir(parents=True, exist_ok=True)
+            ETF_UNIVERSE_FILE.write_text(
+                json.dumps({"as_of": today, "total": len(etfs), "etfs": etfs},
+                           ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+    return etfs
+
+
+def analyze_etf(s: dict, as_of: datetime | None = None) -> dict | None:
+    """
+    场内 ETF：纯量价共振口径（共振50 + 倍量25 + 试盘25，达标线 85）。
+    ETF 无概念/股东户数/主力资金，硬套四条件会复刻「达标 0」。
+    """
+    try:
+        bars = fetch_kline(s["code"])
+        if len(bars) < 40:
+            return None
+        vol = compute_volume(bars)
+        box = compute_box(bars)
+        tests = box["tests"] if box else 0
+        base, flags = 0, []
+        if vol["volume_days"] >= VOL_DAYS_REQ and vol["volume_ratio"] >= VOL_MULT:
+            base += 25
+            flags.append([f"倍量{vol['volume_days']}日", 1])
+        elif vol["volume_days"] >= 2 or vol["volume_ratio"] >= 1.5:
+            base += 12
+            flags.append([f"放量不足({vol['volume_days']}日)", 0])
+        else:
+            flags.append([f"量能弱({vol['volume_days']}日)", 0])
+        if tests >= 3:
+            base += 25
+            flags.append([f"试盘{tests}次", 1])
+        elif tests >= 2:
+            base += 10
+            flags.append([f"试盘{tests}次", 0])
+        else:
+            flags.append([f"试盘{tests}次", 0])
+        row = {
+            "code": s["code"], "name": s["name"], "market": "etf",
+            "price": s["price"], "chg": s["chg"], "turnover": None,
+            "volume_ratio": vol["volume_ratio"], "volume_ratio_raw": vol["volume_ratio"],
+            "volume_days": vol["volume_days"],
+            "box_low": box["box_low"] if box else None,
+            "box_high": box["box_high"] if box else None,
+            "pos_pct": box["pos_pct"] if box else None,
+            "box_span_pct": box["span_pct"] if box else None,
+            "box_window": box["window"] if box else None,
+            "tests": tests,
+            "test_dates": box["test_dates"] if box else [],
+            "fund_5d": None, "inflow_days": 0, "fund_state": "—",
+            "control": "—", "holder_ratio": None, "control_note": "", "holder_date": None,
+            "theme_hint": "ETF", "theme_ok": False, "hot_boards": [], "concepts": [],
+            "base_score": base, "score": base,
+            "flags": [f[0] for f in flags], "flag_pairs": flags,
+            "mode": "ETF观察", "qualified": False,
+            "bar_date": bars[-1]["date"], "as_of_quote": now_str(),
+        }
+        return apply_resonance(row, as_of or datetime.now(BJT), daily_bars=bars)
+    except Exception:
+        return None
+
+
 def analyze_market(s: dict, hot_names: set[str], as_of: datetime | None = None) -> dict | None:
     """对粗筛候选做全量四条件计算；数据不足返回 None（不占位）。"""
     try:
@@ -1047,72 +1182,104 @@ def analyze_market(s: dict, hot_names: set[str], as_of: datetime | None = None) 
             "bar_date": bars[-1]["date"],
             "as_of_quote": now_str(),
         }
-        return apply_resonance(score_row(row), as_of or datetime.now(BJT))
+        return apply_resonance(score_row(row), as_of or datetime.now(BJT), daily_bars=bars)
     except Exception:
         return None
 
 
 def _save_market(rows: list[dict], stocks: list[dict], hot_topics: list[dict],
                  done: int, total: int, final: bool) -> None:
+    # 全量K线只用于计算，落盘只留信号/高分行 + 尾部K线（否则 watchlist 会膨胀到几十 MB）
+    keep = [r for r in rows if (r.get("score") or 0) >= SAVE_MIN_SCORE
+            or r.get("resonance_level") in ("strong", "soft", "near")]
+    for r in keep:
+        tf = r.get("timeframes")
+        if tf:
+            trimmed = {}
+            for p, n in SAVE_BARS.items():
+                frame = tf.get(p)
+                if frame:
+                    frame = dict(frame)
+                    if frame.get("bars"):
+                        frame["bars"] = frame["bars"][-n:]
+                    trimmed[p] = frame
+            r["timeframes"] = trimmed
     payload = {
         "as_of": now_str(),
-        "strategy": "箱体突破战法",
+        "strategy": "多周期共振箱体突破",
         "scope": "market",
         "universe_size": len(stocks),
         "screened": total,
         "scored": len(rows),
+        "saved": len(keep),
         "scanned": done,
         "done": final,
         "hot_topics": [{"code": b["code"], "name": b["name"],
                         "chg1": b["chg1"], "chg5": b["chg5"]} for b in hot_topics],
-        "candidates": rows,
+        "candidates": keep,
     }
     DATA.mkdir(parents=True, exist_ok=True)
-    WATCH_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # K线数组展开 indent 会放大 10 倍体积，紧凑写盘
+    WATCH_FILE.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                          encoding="utf-8")
 
 
 def run_market_scan(full: bool = True, top: int = MARKET_TOP,
                     workers: int = MARKET_WORKERS, progress=None) -> list[dict]:
     """
-    全市场扫描。full=True：沪深全部 A 股逐一深度计算（无粗筛）；
-    full=False（快扫）：量比粗筛 TOP N 后深度计算。
+    全市场扫描（共振主筛）：full=True 对当日活跃池全体深度计算（换手/涨幅/量比粗筛），
+    full=False（快扫）只取活跃强度 TOP N；A 股之后并入活跃 ETF 池（纯量价共振口径）。
     """
     as_of = datetime.now(BJT)
     if progress:
         progress("拉取沪深 A 股全量清单（首次较慢，此后按日缓存）…")
     stocks = fetch_universe()
     pool_codes = {p["code"] for p in load_pool()}
-    if full:
-        picked = list(stocks)
-        if progress:
-            progress(f"全市场 {len(stocks)} 只，全部深度计算（无粗筛）…")
-    else:
-        picked = screen_universe(stocks, top, pool_codes)
-        if progress:
-            progress(f"全市场 {len(stocks)} 只 → 快扫粗筛出 {len(picked)} 只候选")
+    picked = screen_universe(stocks, None if full else top, pool_codes)
+    if progress:
+        progress(f"全市场 {len(stocks)} 只 → 活跃池 {len(picked)} 只"
+                 f"（涨幅/换手/量比，自选池保送），开始并发深度计算（{workers} 线程）…")
+
+    etf_picked: list[dict] = []
+    etfs = fetch_etf_universe()
+    if etfs:
+        etf_picked = [e for e in etfs
+                      if e["amount"] >= ETF_AMT_MIN and e["price"] > 0 and 0 < e["chg"] < 9.8]
+    if progress:
+        progress(f"活跃 ETF（成交额≥{ETF_AMT_MIN / 1e7:.0f}千万）{len(etf_picked)} 只并入扫描…")
 
     hot_topics, hot_names = fetch_hot_topics()
     if progress:
-        progress(f"热点概念 TOP{len(hot_topics)} 已就绪，开始并发深度计算（{workers} 线程）…")
+        progress(f"热点概念 TOP{len(hot_topics)} 已就绪，共振评估对池内全体执行…")
 
     rows, done = [], 0
     lock = threading.Lock()
+    total = len(picked) + len(etf_picked)
+
+    def bump():
+        nonlocal done
+        with lock:
+            done += 1
+            if progress and done % 100 == 0:
+                progress(f"深度计算 {done}/{total}，已有效 {len(rows)} 只")
+            if done % 300 == 0:          # 断点保护：每 300 只落盘一次
+                _save_market(sorted(rows, key=lambda r: r.get("score") or 0, reverse=True),
+                             stocks, hot_topics, done, total, final=False)
 
     def one(s: dict):
-        nonlocal done
         try:
             return analyze_market(s, hot_names, as_of)
         finally:
-            with lock:
-                done += 1
-                if progress and done % 100 == 0:
-                    progress(f"深度计算 {done}/{len(picked)}，已有效 {len(rows)} 只")
-                if done % 300 == 0:          # 断点保护：每 300 只落盘一次
-                    _save_market(sorted(rows, key=lambda r: r.get("score") or 0, reverse=True),
-                                 stocks, hot_topics, done, len(picked), final=False)
+            bump()
+
+    def one_etf(e: dict):
+        try:
+            return analyze_etf(e, as_of)
+        finally:
+            bump()
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(one, s) for s in picked]
+        futs = [ex.submit(one, s) for s in picked] + [ex.submit(one_etf, e) for e in etf_picked]
         for f in as_completed(futs):
             try:
                 r = f.result()
@@ -1121,13 +1288,18 @@ def run_market_scan(full: bool = True, top: int = MARKET_TOP,
             except Exception:
                 pass
 
-    rows.sort(key=lambda r: (r.get("score") or 0, r.get("volume_ratio") or 0,
-                             r.get("chg") or 0), reverse=True)
-    _save_market(rows, stocks, hot_topics, done, len(picked), final=True)
-    skipped = len(picked) - len(rows)
+    def rank(r):
+        lvl = {"strong": 0, "soft": 1, "near": 2}.get(r.get("resonance_level"), 3)
+        return (-lvl, -(r.get("score") or 0), -(r.get("chg") or 0))
+
+    rows.sort(key=rank)
+    _save_market(rows, stocks, hot_topics, done, total, final=True)
+    skipped = total - len(rows)
+    strong = sum(1 for r in rows if r.get("resonance_level") == "strong")
+    soft = sum(1 for r in rows if r.get("resonance_level") == "soft")
     if progress:
-        progress(f"完成：有效评分 {len(rows)} 只（数据不足跳过 {skipped} 只），"
-                 f"达标 {sum(1 for r in rows if r.get('qualified'))} 只")
+        progress(f"完成：有效评估 {len(rows)} 只（数据不足跳过 {skipped} 只）｜"
+                 f"强共振 {strong} · 准共振 {soft} · 达标 {sum(1 for r in rows if r.get('qualified'))} 只")
     return rows
 
 
@@ -1291,34 +1463,37 @@ def fmt_money(wan: float | None) -> str:
 
 def format_alert(rows: list[dict]) -> str:
     lines = [
-        f"箱体突破战法扫描  {now_str()}",
-        "条件: 热点题材 | 倍量≥3日 | 资金流入+控盘 | 试盘≥3次",
+        f"多周期共振箱体突破扫描  {now_str()}",
+        "强共振 = 1d突破 + 1h/30m确认 | 准共振 = 1d临界 + 小周期点火",
         "",
     ]
     rows = [rs.qualify(r) for r in rows]
     hits = [r for r in rows if r.get("qualified")]
-    watch = [r for r in rows if not r.get("qualified") and (r.get("score") or 0) >= 70]
+    watch = [r for r in rows if not r.get("qualified")
+             and r.get("resonance_level") in ("soft", "near") and (r.get("score") or 0) >= 70]
 
     def item(r: dict) -> list[str]:
         px = f"{r['price']:.2f}" if r.get("price") else "—"
         chg = f"{r['chg']:+.2f}%" if r.get("chg") is not None else ""
         box = f"{r['box_low']}–{r['box_high']}" if r.get("box_low") else "—"
+        states = r.get("res_states") or {}
+        tf = " ".join(f"{p}:{states.get(p) or '—'}" for p in ("30m", "1h", "1d"))
         return [
             f"  {r['name']} {r['code']}  {px} {chg}  评分{r['score']}  {r['mode']}",
-            f"    箱体 {box} | 倍量{r.get('volume_days', 0)}日(量比{r.get('volume_ratio', 0):.2f}) | "
-            f"{r.get('fund_state', '—')}{fmt_money(r.get('fund_5d'))}/{r.get('control', '—')}控盘 | 试盘{r.get('tests', 0)}次",
+            f"    共振[{tf}] | 箱体 {box} | 倍量{r.get('volume_days', 0)}日"
+            f"(量比{r.get('volume_ratio', 0):.2f}) | 试盘{r.get('tests', 0)}次",
         ]
 
     if not hits and not watch:
-        lines.append("本日无达标/观察标的。")
+        lines.append("本日无共振信号。")
     else:
         if hits:
-            lines.append("【达标（A股：≥85且三周期共振）】")
+            lines.append("【达标（强共振 / 准共振·评分≥70）】")
             for r in hits:
                 lines += item(r)
             lines.append("")
         if watch:
-            lines.append("【观察（未达标且评分≥70）】")
+            lines.append("【观察（共振临界·评分≥70，次日跟踪）】")
             for r in watch:
                 lines += item(r)
     lines += ["", "超短线战法，注意仓位与假突破。非投资建议。"]

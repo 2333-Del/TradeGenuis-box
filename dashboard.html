@@ -115,6 +115,9 @@
     .sig { background: var(--card); border: 1px solid var(--card-border); border-radius: var(--r); padding: 12px 14px 10px; animation: rise .45s cubic-bezier(.2,.7,.3,1) both; }
     .sig.q { border-color: rgba(155,213,151,.5); box-shadow: 0 0 0 1px rgba(155,213,151,.2); }
     .q-badge { display: inline-block; margin-left: 7px; padding: 0 7px; border-radius: 999px; font-family: var(--num); font-size: 11px; font-weight: 600; color: var(--mint-ink); background: var(--up); vertical-align: 1px; }
+    .q-badge.soft { background: rgba(232,196,104,.22); color: #E8C468; }
+    .q-badge.near { background: rgba(120,140,200,.25); color: #9FB0E8; }
+    .resonance .warn { color: #E8C468; }
     @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
     .sig-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
     .sig .nm { font-size: 14px; font-weight: 700; white-space: nowrap; }
@@ -246,7 +249,7 @@ function renderAll() {
   } else if (S.selBoard) {
     $("cardsTitle").innerHTML = `板块「${S.selBoard}」 <span class="plan-count" id="poolCount" data-board-count>—</span>`;
   } else {
-    $("cardsTitle").innerHTML = `A股共振达标 <span class="plan-count" id="poolCount">${S.loaded ? hits.length : ""}</span>`;
+    $("cardsTitle").innerHTML = `A股共振信号 <span class="plan-count" id="poolCount">${S.loaded ? hits.length : ""}</span> <span class="mode-tag" style="color:var(--up)">达标 ${hits.length}</span>`;
   }
   // A股：展示当前热门板块（可点击筛选）；接口限流则诚实提示
   const hotEl = $("hotTopics");
@@ -297,7 +300,10 @@ function renderCards(rows) {
     const cnt = document.querySelector("[data-board-count]");
     if (cnt) cnt.textContent = shown.length;
   } else {
-    shown = rows.filter(r => r.qualified);
+    // 共振信号视图：强/准/临界全部展示（强在前）；qualified 不再是唯一入口
+    const rank = { strong: 0, soft: 1, near: 2 };
+    shown = rows.filter(r => r.qualified || ["soft", "near"].includes(r.resonance_level))
+      .sort((a, b) => (rank[a.resonance_level] ?? 3) - (rank[b.resonance_level] ?? 3) || (b.score || 0) - (a.score || 0));
   }
   if (!shown.length) {
     box.innerHTML = `<div class="empty"><div class="big">NO SIGNAL</div><p>${S.selBoard ? `该板块暂无股票` : isCrypto ? "暂无数据" : rows.some(r => r.resonance_status === "数据不可用") ? "行情获取失败，暂无已确认共振标的" : rows.some(r => !r.resonance_status) ? "待重新扫描：旧结果尚未评估共振" : "暂无多周期共振标的"}</p>
@@ -310,11 +316,18 @@ function renderCards(rows) {
 
 function cardHTML(r, i) {
   const isCrypto = S.market === "crypto";
+  const isEtf = r.market === "etf";
   const items = isCrypto
     ? [
         ["倍量", (r.volume_days || 0) + "日", r.volume_days >= 3 && r.volume_ratio >= 1.8],
         ["试盘", (r.tests ?? 0) + "次", (r.tests || 0) >= 3],
         ["24h", signOf(r.chg, "crypto") + "%", r.chg > 0],
+      ]
+    : isEtf
+    ? [
+        ["倍量", (r.volume_days || 0) + "日", r.volume_days >= 3 && r.volume_ratio >= 1.8],
+        ["试盘", (r.tests ?? 0) + "次", (r.tests || 0) >= 3],
+        ["ETF", r.theme_hint === "ETF" ? "量价口径" : "—", true],
       ]
     : [
         ["热点", r.theme_ok ? "✓" : "—", r.theme_ok],
@@ -325,18 +338,30 @@ function cardHTML(r, i) {
       ];
   const price = isCrypto ? fmtc(r.price) : fmt2(r.price);
   const chgText = signOf(r.chg, S.market) + "%";
-  // 达标标的加高亮描边 + 「达标」标记
-  const qBadge = (r.qualified) ? '<span class="q-badge">达标</span>' : "";
+  // 共振分级徽标：强共振（推送）/ 准共振（推送或评分不足）/ 临界（次日跟踪）
+  const stateName = { BREAK: "突破", NEAR: "临界", INSIDE: "箱内", BELOW: "箱下", NA: "—" };
+  const qBadge = r.resonance_level === "strong" ? '<span class="q-badge">强共振</span>'
+    : r.resonance_level === "soft" && r.qualified ? '<span class="q-badge soft">准共振</span>'
+    : r.resonance_level === "soft" ? '<span class="q-badge soft">准共振·分不足</span>'
+    : r.resonance_level === "near" ? '<span class="q-badge near">临界</span>' : "";
+  const resClass = { BREAK: "", NEAR: "warn", INSIDE: "no", BELOW: "no", NA: "no" };
+  const tfSpan = p => {
+    const f = r.timeframes?.[p];
+    const st = f?.state;
+    if (!st) return `<span class="no">${p} · ${esc(r.resonance_status || '待重新扫描')}</span>`;
+    const dist = f.dist_pct != null ? ` ${f.dist_pct >= 0 ? "+" : ""}${f.dist_pct.toFixed(1)}%` : "";
+    return `<span class="${resClass[st] || 'no'}">${p}·${stateName[st] || st}${dist}</span>`;
+  };
   return `<article class="sig${r.qualified ? ' q' : ''}" data-code="${r.code}" data-market="${S.market}" style="animation-delay:${Math.min(i * 50, 400)}ms">
     <div class="sig-top">
-      <div><div class="nm">${r.name}${qBadge}</div><div class="cd">${r.code}</div></div>
+      <div><div class="nm">${r.name}${qBadge}</div><div class="cd">${r.code}${isEtf ? " · ETF" : ""}</div></div>
       <div class="sig-top-right"><span class="px" data-px>${price}</span>
         <span class="chg ${clsOf(r.chg)}" data-chg>${chgText}</span>
-        <span class="score-badge" title="原策略评分；A股还须三周期共振">${r.score}</span></div>
+        <span class="score-badge" title="${isEtf ? "共振50+倍量25+试盘25" : "质量评分（共振为主筛，评分排序）"}">${r.score}</span></div>
     </div>
     ${!isCrypto ? `<div class="sig-line resonance">
-      <b>共振 ${periods.filter(p => r.timeframes?.[p]?.ok).length}/3</b>
-      ${periods.map(p => `<span class="${r.timeframes?.[p]?.ok ? '' : 'no'}">${p} · ${esc(r.timeframes?.[p]?.reason || r.resonance_status || '待重新扫描')}</span>`).join('')}
+      <b>共振 ${({ strong: "强", soft: "准", near: "临界", none: "—" })[r.resonance_level] || "—"}</b>
+      ${periods.map(tfSpan).join('')}
       <label>图表 <select aria-label="K线周期" onchange="loadChart('${r.code}', this.value)">${periods.map(p => `<option value="${p}" ${p === '1d' ? 'selected' : ''}>${p}</option>`).join('')}</select></label>
       <span data-confirm></span></div>` : ''}
     <div class="sig-chart"><canvas height="264" data-code="${r.code}" data-market="${S.market}"></canvas><div class="tip" data-code="${r.code}"></div></div>
@@ -344,7 +369,7 @@ function cardHTML(r, i) {
       ${items.map(([t, v, ok]) => ok
         ? `<span><b>${t}</b> ${v}</span>`
         : `<span class="no">${t} ${v}</span>`).join("")}
-      <span class="box">${isCrypto ? "箱体" : "原评分日线箱体"} ${fmt2(r.box_low)}–${fmt2(r.box_high)}</span>
+      <span class="box">${isCrypto ? "箱体" : isEtf ? "日线箱体" : "原评分日线箱体"} ${fmt2(r.box_low)}–${fmt2(r.box_high)}</span>
     </div>
   </article>`;
 }
@@ -459,7 +484,7 @@ async function refreshQuotes() {
   if (!S.loaded) return;
   const data = S.market === "crypto" ? (S.crypto || {}) : (S.watch || {});
   const rows = data.candidates || [];
-  const codes = rows.filter(r => r.qualified).map(r => r.code);
+  const codes = rows.filter(r => r.qualified || ["soft", "near"].includes(r.resonance_level)).map(r => r.code);
   if (!codes.length || S.market === "crypto") return;  // 币圈价格在扫描时已定格，3s 刷新仅 A股
   try {
     const qs = await jfetch("api/quotes?codes=" + codes.join(","));
@@ -517,7 +542,7 @@ function switchMarket(market) {
   $("btnScan").textContent = market === "crypto" ? "币圈扫描" : "全市场扫描";
   renderAll();
   const data = market === "crypto" ? (S.crypto || {}) : (S.watch || {});
-  (data.candidates || []).filter(r => r.qualified).forEach(r => loadChart(r.code));
+  (data.candidates || []).filter(r => r.qualified || ["soft", "near"].includes(r.resonance_level)).slice(0, 30).forEach(r => loadChart(r.code));
 }
 
 /* =============================== 启动 =============================== */
