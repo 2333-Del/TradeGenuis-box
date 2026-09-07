@@ -1,0 +1,16 @@
+services:
+  dashboard:
+    build: .
+    container_name: tradegenuis
+    restart: unless-stopped
+    ports:
+      # 对公网开放前建议改为 "127.0.0.1:8808:8808"，由 Nginx/Caddy 反代加 HTTPS
+      - "8808:8808"
+    environment:
+      # 必改：外网访问密码。不设置时服务只允许本机访问（容器内等于全部拒绝）
+      DASHBOARD_PASSWORD: "change-me-please"
+      # Telegram 推送（可选）
+      # TG_BOT_TOKEN: ""
+      # TG_CHAT_ID: ""
+    volumes:
+      - ./data:/app/data   # 扫描结果/缓存/自选池/配置 持久化在宿主机

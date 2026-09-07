@@ -1,0 +1,10 @@
+.git
+.gitignore
+__pycache__/
+**/__pycache__/
+*.pyc
+data/
+tests/
+docs/
+start.sh
+*.md

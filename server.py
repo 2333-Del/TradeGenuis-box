@@ -7,7 +7,9 @@ TradeGenuis · 箱体突破 本地看板服务器
   访问：  http://127.0.0.1:8808
 
 接口：
-  GET  /                    看板页
+  GET  /                    看板页（未认证时返回登录页）
+  POST /api/login           密码登录 → HttpOnly 会话 Cookie
+  POST /api/logout          退出（吊销当前 token）
   GET  /api/watchlist       最近一次扫描结果
   GET  /api/pool            自选池
   POST /api/pool            增删自选池
@@ -16,15 +18,22 @@ TradeGenuis · 箱体突破 本地看板服务器
   GET  /api/status          扫描状态/日志
   GET/POST /api/config      配置（自动扫描 / Telegram）
 
+访问控制（部署到公网必读）：
+  设置环境变量 DASHBOARD_PASSWORD 后，所有请求须先登录；
+  未设置密码时仅允许本机（127.0.0.1）访问，远端一律 401。
+  会话 token 存内存，重启进程即全部失效。
+
 自动扫描调度：config.auto 开启时，每个交易日 11:30 与 15:00 自动执行全市场扫描。
 """
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
+import os
+import secrets
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,6 +44,9 @@ ROOT = Path(__file__).resolve().parent
 WATCH_FILE = ROOT / "data" / "watchlist.json"
 POOL_FILE = ROOT / "data" / "pool.json"
 CONFIG_FILE = ROOT / "data" / "config.json"
+
+AUTH_COOKIE = "tg_auth"
+AUTH_MAX_AGE = 7 * 24 * 3600   # 会话有效期（秒）；服务端 token 重启即失效
 
 DEFAULT_CONFIG = {
     "auto": True,                       # 自动扫描开关
@@ -51,9 +63,58 @@ STATE = {
     "quote_cache": {},         # code -> (ts, payload) 2.5s 内存缓存
     "auto_done": set(),        # 已触发的自动扫描时间键 "YYYY-MM-DD HH:MM"
     "config": dict(DEFAULT_CONFIG),
+    "auth_tokens": set(),      # 已登录会话 token（内存态，重启清空）
 }
 LOCK = threading.Lock()
 CACHE_TTL = 60
+
+
+def auth_password() -> str:
+    return os.environ.get("DASHBOARD_PASSWORD", "").strip()
+
+
+def _is_local(addr: str) -> bool:
+    return addr in ("127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost")
+
+
+LOGIN_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TradeGenuis · 登录</title><style>
+:root{--bg:#101522;--card:#171E31;--ink:#E5D4B6;--dim:#8B93A8;--gold:#E8C468;--up:#3EAF85}
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;
+  background:radial-gradient(1200px 600px at 70% -10%,#1B2440,var(--bg));color:var(--ink);
+  font-family:"IBM Plex Mono","SFMono-Regular",Consolas,monospace}
+main{width:min(360px,92vw);background:var(--card);border:1px solid #2A3350;border-radius:14px;
+  padding:34px 30px;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+h1{font-size:20px;letter-spacing:.5px}
+h1 b{color:var(--gold)}
+p{color:var(--dim);font-size:12px;margin:8px 0 22px}
+input{width:100%;padding:11px 13px;border-radius:8px;border:1px solid #2F3A5C;
+  background:#10182B;color:var(--ink);font:inherit;outline:none}
+input:focus{border-color:var(--gold)}
+button{width:100%;margin-top:14px;padding:11px;border:none;border-radius:8px;cursor:pointer;
+  background:var(--up);color:#06120D;font:inherit;font-weight:700}
+button:hover{filter:brightness(1.08)}
+#msg{color:#E36C6C;font-size:12px;min-height:18px;margin-top:10px;text-align:center}
+</style></head><body><main>
+<h1>Trade<b>Genuis</b> 多周期共振看板</h1><p>Private · 请输入访问密码</p>
+<form id="f"><input type="password" id="pw" placeholder="访问密码" autofocus
+  autocomplete="current-password"><button type="submit">进入看板</button><div id="msg"></div></form>
+<script>
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('msg'); msg.textContent = '';
+  try {
+    const r = await fetch('api/login', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: document.getElementById('pw').value})});
+    if (r.ok) { location.replace('./'); return; }
+    const d = await r.json().catch(() => ({}));
+    msg.textContent = d.error || '密码错误';
+  } catch (err) { msg.textContent = '网络错误'; }
+});
+</script></main></body></html>"""
 
 
 def log(msg: str) -> None:
@@ -145,8 +206,14 @@ def save_pool(stocks: list[dict]) -> None:
     )
 
 
+QT_BATCH = 50   # 腾讯批量行情单次 URL 的代码数上限（部署在服务器上的常驻压力主要来自这里）
+
+
 def get_quotes(codes: list[str]) -> dict:
-    """批量实时行情（价格/涨跌/换手/量比），2.5s 内存缓存，8 并发。"""
+    """
+    批量实时行情：腾讯 qt 批量接口（一次 50 只），2.5s 内存缓存；
+    批量缺口用单只接口兜底。比逐只请求东财 push2 少 95%+ 的常驻流量。
+    """
     out, need = {}, []
     now = time.time()
     for c in codes:
@@ -155,22 +222,34 @@ def get_quotes(codes: list[str]) -> dict:
             out[c] = hit[1]
         else:
             need.append(c)
-    if need:
-        def one(c):
-            try:
-                return c, sc.fetch_quote(c)
-            except Exception:
-                return c, None
-
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            for c, qq in ex.map(one, need):
-                if qq:
+    for i in range(0, len(need), QT_BATCH):
+        batch = need[i:i + QT_BATCH]
+        got: dict[str, dict] = {}
+        try:
+            r = sc.HTTP.get("https://qt.gtimg.cn/q=" +
+                            ",".join(sc.tx_symbol(c) for c in batch), timeout=8)
+            for line in r.content.decode("gbk", errors="ignore").split(";"):
+                p = line.split("~")
+                if len(p) < 50 or not p[2] or not p[3]:
+                    continue
+                try:
+                    got[p[2]] = {"price": float(p[3]), "chg": float(p[32]),
+                                 "turnover": float(p[38]), "volume_ratio": float(p[49])}
+                except (ValueError, IndexError):
+                    continue
+        except Exception:
+            pass
+        for c in batch:
+            payload = got.get(c)
+            if payload is None:                  # 批量缺口：单只兜底
+                try:
+                    qq = sc.fetch_quote(c)
                     payload = {"price": qq["price"], "chg": qq["chg"],
                                "turnover": qq["turnover"], "volume_ratio": qq["volume_ratio"]}
-                else:
+                except Exception:
                     payload = None
-                STATE["quote_cache"][c] = (time.time(), payload)
-                out[c] = payload
+            STATE["quote_cache"][c] = (time.time(), payload)
+            out[c] = payload
     return out
 
 
@@ -209,11 +288,64 @@ def get_kline(code: str, lmt: int = 160, market: str = "stock", interval: str = 
 class Handler(BaseHTTPRequestHandler):
     server_version = "TradeGenuis/2.0"
 
-    def _send(self, code: int, body: bytes, ctype: str = "application/json; charset=utf-8"):
+    # ---------------- 访问控制 ---------------- #
+    def _bearer_token(self) -> str:
+        cookie = self.headers.get("Cookie") or ""
+        for part in cookie.split(";"):
+            part = part.strip()
+            if part.startswith(AUTH_COOKIE + "="):
+                return part.split("=", 1)[1]
+        return ""
+
+    def _authenticated(self) -> bool:
+        pwd = auth_password()
+        if not pwd:
+            # 未设密码：只允许本机直连。容器/服务器场景请务必设置 DASHBOARD_PASSWORD
+            return _is_local(self.client_address[0])
+        token = self._bearer_token()
+        with LOCK:
+            return bool(token and token in STATE["auth_tokens"])
+
+    def _send_login_page(self):
+        self._send(200, LOGIN_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+
+    def _handle_login(self):
+        body = self._body()
+        supplied = str(body.get("password") or "")
+        pwd = auth_password()
+        if not pwd:
+            self._json({"error": "服务器未设置访问密码（DASHBOARD_PASSWORD）"}, 401)
+            return
+        time.sleep(0.3)                          # 轻微延迟，增加爆破成本
+        if not hmac.compare_digest(supplied.encode(), pwd.encode()):
+            self._json({"error": "密码错误"}, 401)
+            return
+        token = secrets.token_urlsafe(32)
+        with LOCK:
+            STATE["auth_tokens"].add(token)
+        body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+        self._send(200, body, "application/json; charset=utf-8", extra_headers=[
+            ("Set-Cookie", f"{AUTH_COOKIE}={token}; HttpOnly; Path=/; "
+                           f"SameSite=Strict; Max-Age={AUTH_MAX_AGE}"),
+        ])
+
+    def _handle_logout(self):
+        token = self._bearer_token()
+        with LOCK:
+            STATE["auth_tokens"].discard(token)
+        body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+        self._send(200, body, "application/json; charset=utf-8", extra_headers=[
+            ("Set-Cookie", f"{AUTH_COOKIE}=; HttpOnly; Path=/; Max-Age=0"),
+        ])
+
+    def _send(self, code: int, body: bytes, ctype: str = "application/json; charset=utf-8",
+              extra_headers: list[tuple[str, str]] | None = None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for k, v in extra_headers or []:
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -231,6 +363,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         p = self.path.split("?")[0]
+        if not self._authenticated():
+            if p in ("/", "/index.html"):
+                self._send_login_page()          # 看板 HTML 本身无敏感数据，登录页就地替换
+            else:
+                self._json({"error": "unauthorized"}, 401)
+            return
         q = {}
         if "?" in self.path:
             for kv in self.path.split("?", 1)[1].split("&"):
@@ -309,6 +447,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = self.path.split("?")[0]
+        if p == "/api/login":
+            self._handle_login()
+            return
+        if not self._authenticated():
+            self._json({"error": "unauthorized"}, 401)
+            return
+        if p == "/api/logout":
+            self._handle_logout()
+            return
         if p == "/api/scan":
             if STATE["scanning"]:
                 self._json({"status": "running", "msg": "扫描进行中"})
@@ -366,6 +513,7 @@ def main() -> int:
     args = ap.parse_args()
 
     load_config()
+    log(f"访问控制：{'密码登录已启用' if auth_password() else '未设置 DASHBOARD_PASSWORD，仅允许本机访问'}")
     log(f"自动扫描：{'开' if STATE['config'].get('auto') else '关'} · "
         f"{' / '.join(STATE['config'].get('auto_times') or [])} 每个交易日")
     if not WATCH_FILE.exists():
