@@ -14,6 +14,7 @@
   资金流   ：push2his.eastmoney.com daykline（需 ut 参数）  备用新浪资金流
   股东户数 ：datacenter-web.eastmoney.com
   热点概念 ：push2.eastmoney.com clist + emweb F10 所属板块
+  同花顺   ：data.10jqka.com.cn（行情/资金流，作为第三数据源增强稳定性）
 
 用法：
   pip install requests
@@ -37,6 +38,16 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
+
+try:
+    import ths  # 同花顺第三数据源（d.10jqka.com.cn，无需 cookie）
+except Exception:
+    ths = None
+
+try:
+    import em  # 东方财富镜像轮询客户端（push2/push2his/datacenter 多主机故障转移）
+except Exception:
+    em = None
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -123,11 +134,10 @@ def secid(code: str) -> str:
 def fetch_quote(code: str) -> dict:
     """实时行情：东财 push2 主源，腾讯 qt 兜底（东财限流时自动切换）。"""
     try:
-        url = (
-            "https://push2.eastmoney.com/api/qt/stock/get"
-            f"?secid={secid(code)}&fields=f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f168,f170"
-        )
-        d = (http_json(url) or {}).get("data") or {}
+        d = (em.get_json(em.PUSH2, "/api/qt/stock/get", {
+            "secid": secid(code),
+            "fields": "f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f168,f170",
+        }) or {}).get("data") or {}
         if d.get("f43"):
             return {
                 "price": (d.get("f43") or 0) / 100,
@@ -142,6 +152,12 @@ def fetch_quote(code: str) -> dict:
     r = HTTP.get(f"https://qt.gtimg.cn/q={tx_symbol(code)}", timeout=8)
     p = r.content.decode("gbk", errors="ignore").split("~")
     if len(p) < 40 or not p[3]:
+        # 同花顺兜底
+        if ths is not None:
+            try:
+                return ths.fetch_quote(code)
+            except Exception:
+                pass
         raise RuntimeError("quote empty (tencent)")
     return {
         "price": float(p[3]),
@@ -192,6 +208,12 @@ def fetch_kline(code: str, lmt: int = 160) -> list[dict]:
             return bars
     except Exception:
         pass
+    # 同花顺兜底（不复权，近期无除权时与复权价一致，形态判断可用）
+    if ths is not None:
+        try:
+            return ths.fetch_kline(code, lmt)
+        except Exception:
+            pass
     raise RuntimeError(f"kline unavailable for {code}")
 
 
@@ -219,11 +241,10 @@ def fetch_fund_flow(code: str, days: int = FUND_DAYS + 6) -> list[dict]:
     global _EM_FLOW_DOWN
     if not _EM_FLOW_DOWN:
         try:
-            url = (
-                "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-                f"?lmt=0&klt=101&secid={secid(code)}&fields1=f1,f2,f3,f7&fields2={f2}&ut={EM_UT}"
-            )
-            d = (http_json(url) or {}).get("data") or {}
+            d = (em.get_json(em.PUSH2HIS, "/api/qt/stock/fflow/daykline/get", {
+                "lmt": 0, "klt": 101, "secid": secid(code),
+                "fields1": "f1,f2,f3,f7", "fields2": f2, "ut": EM_UT,
+            }) or {}).get("data") or {}
             out = []
             for line in (d.get("klines") or []):
                 p = line.split(",")
@@ -264,14 +285,50 @@ JUNK_BOARD = re.compile(
 )
 
 
-def fetch_concept_boards() -> list[dict]:
-    """拉取东方财富概念板块全表（按当日涨幅排序）。失败返回空列表。"""
+def _concept_boards_sina() -> list[dict]:
+    """
+    新浪概念板块兜底（EM clist 被限流时）。
+    vip.stock.finance.sina.com.cn/q/view/newFLJK.php?param=class
+    字段: [code, 名称, 家数, 均价, 当日涨跌%, ?, 成交量, 成交额, 领涨股code, 领涨股涨%, ...]
+    无 5 日涨幅(chg5)与主力净流入(main)，置 0 —— 仅影响展示，不影响 theme_ok 匹配。
+    """
+    r = HTTP.get(
+        "https://vip.stock.finance.sina.com.cn/q/view/newFLJK.php?param=class",
+        timeout=10, headers={"Referer": "https://vip.stock.finance.sina.com.cn/"})
+    m = re.search(r"=\s*(\{.*\})", r.content.decode("gbk", errors="ignore"), re.S)
+    if not m:
+        return []
+    boards = []
     try:
-        url = (
-            "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=80&po=1&np=1&fltt=2&invt=2"
-            "&fid=f3&fs=m:90+t:3+f:!50&fields=f3,f8,f12,f14,f62,f104,f105,f109"
-        )
-        d = (http_json(url) or {}).get("data") or {}
+        import json as _json
+        data = _json.loads(m.group(1).replace("'", '"'))
+    except Exception:
+        return []
+    for v in data.values():
+        p = str(v).split(",")
+        if len(p) < 5:
+            continue
+        name = p[1].strip()
+        if not name or JUNK_BOARD.search(name):
+            continue
+        try:
+            chg1 = float(p[4])
+        except ValueError:
+            chg1 = 0.0
+        boards.append({"code": p[0], "name": name, "chg1": chg1, "chg5": 0.0,
+                       "main": 0.0, "up": 1, "down": 0})
+    boards.sort(key=lambda b: b["chg1"], reverse=True)
+    return boards
+
+
+def fetch_concept_boards() -> list[dict]:
+    """拉取东方财富概念板块全表（按当日涨幅排序）；限流时用新浪概念兜底。失败返回空列表。"""
+    try:
+        d = (em.get_json(em.PUSH2, "/api/qt/clist/get", {
+            "pn": 1, "pz": 80, "po": 1, "np": 1, "fltt": 2, "invt": 2, "ut": em.EM_UT,
+            "fid": "f3", "fs": "m:90+t:3+f:!50",
+            "fields": "f3,f8,f12,f14,f62,f104,f105,f109",
+        }) or {}).get("data") or {}
         boards = []
         for b in d.get("diff") or []:
             try:
@@ -288,9 +345,11 @@ def fetch_concept_boards() -> list[dict]:
                 continue
         boards = [b for b in boards if (b["up"] + b["down"]) >= 5]
         boards.sort(key=lambda b: b["chg1"], reverse=True)
-        return boards
+        if boards:
+            return boards
     except Exception:
-        return []
+        pass
+    return _concept_boards_sina()
 
 
 def fetch_hot_topics(topn: int = HOT_TOP_N) -> tuple[list[dict], set[str]]:
@@ -337,14 +396,12 @@ def fetch_concepts(code: str) -> list[str]:
 
 def fetch_holder(code: str) -> dict | None:
     """股东户数（最近两期环比 %）。数据按财报期披露，作为筹码集中度代理。"""
-    url = (
-        "https://datacenter-web.eastmoney.com/api/data/v1/get?"
-        "reportName=RPT_HOLDERNUM_DET&columns=SECURITY_CODE,END_DATE,HOLDER_NUM,"
-        "PRE_HOLDER_NUM,HOLDER_NUM_RATIO,AVG_HOLD_NUM&"
-        f"filter=(SECURITY_CODE%3D%22{code}%22)&pageNumber=1&pageSize=2&"
-        "sortTypes=-1&sortColumns=END_DATE"
-    )
-    d = (http_json(url) or {}).get("result") or {}
+    d = (em.get_json(em.DATACENTER, "/api/data/v1/get", {
+        "reportName": "RPT_HOLDERNUM_DET",
+        "columns": "SECURITY_CODE,END_DATE,HOLDER_NUM,PRE_HOLDER_NUM,HOLDER_NUM_RATIO,AVG_HOLD_NUM",
+        "filter": f'(SECURITY_CODE="{code}")', "pageNumber": 1, "pageSize": 2,
+        "sortTypes": "-1", "sortColumns": "END_DATE",
+    }) or {}).get("result") or {}
     rows = d.get("data") or []
     if not rows:
         return None
@@ -740,15 +797,16 @@ def fetch_universe(force: bool = False) -> list[dict]:
 def _universe_em() -> list[dict] | None:
     """东财 clist 分页拉取（含量比 f10）。失败返回 None。"""
     def page(pn: int):
-        url = (
-            "https://push2.eastmoney.com/api/qt/clist/get"
-            f"?pn={pn}&pz=100&po=1&np=1&fltt=2&invt=2&fid=f12&fs={UNIVERSE_FS}"
-            "&fields=f2,f3,f8,f10,f12,f14,f20"
-        )
         last = None
-        for i in range(4):                       # 单页重试（应对 502/限流）
+        if pn > 1:
+            time.sleep(0.45)                     # 分页节流：避免触发 clist 路径级限流
+        for i in range(2):                       # 单页重试（限流下重试无用，快速失败走新浪兜底）
             try:
-                return (http_json(url, timeout=12) or {}).get("data") or {}
+                return (em.get_json(em.PUSH2, "/api/qt/clist/get", {
+                    "pn": pn, "pz": 100, "po": 1, "np": 1, "fltt": 2, "invt": 2,
+                    "ut": em.EM_UT, "fid": "f12", "fs": UNIVERSE_FS,
+                    "fields": "f2,f3,f8,f10,f12,f14,f20",
+                }, timeout=12) or {}).get("data") or {}
             except Exception as e:
                 last = e
                 time.sleep(0.8 * (i + 1))
@@ -1029,11 +1087,23 @@ def run_market_scan(full: bool = True, top: int = MARKET_TOP,
 # --------------------------------------------------------------------------- #
 CRYPTO_FILE = DATA / "crypto.json"
 BINANCE_FUTURES = "https://fapi.binance.com"
+# fapi 在部分网络不可达时兜底到 spot 镜像（api/v3 形状与 fapi 相同，仅缺资金费率等，
+# 本项目只用 24h 行情与日K，口径一致）
+BINANCE_SPOT = "https://data-api.binance.vision"
+
+
+def _binance_get(path_fapi: str, path_spot: str | None = None, timeout: float = 15.0):
+    """先 fapi（永续），失败退 spot 镜像（api/v3）。"""
+    try:
+        return http_json(f"{BINANCE_FUTURES}{path_fapi}", timeout=timeout)
+    except Exception:
+        return http_json(f"{BINANCE_SPOT}{path_spot or path_fapi.replace('/fapi/', '/api/')}",
+                         timeout=timeout)
 
 
 def fetch_crypto_tickers() -> list[dict]:
-    """Binance USDT 永续全市场 24h 行情，按涨幅 top N 进池子。"""
-    d = http_json(f"{BINANCE_FUTURES}/fapi/v1/ticker/24hr", timeout=15)
+    """Binance USDT 全市场 24h 行情（永续主源，spot 镜像兜底），按涨幅 top N 进池子。"""
+    d = _binance_get("/fapi/v1/ticker/24hr")
     out = []
     for t in d or []:
         sym = str(t.get("symbol") or "")
@@ -1061,10 +1131,7 @@ def fetch_crypto_tickers() -> list[dict]:
 def fetch_crypto_kline(symbol: str, limit: int = CRYPTO_LOOKBACK,
                        interval: str = "1d") -> list[dict]:
     """Binance 永续 K线（日线）。字段 date open close high low vol(币基)。"""
-    d = http_json(
-        f"{BINANCE_FUTURES}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}",
-        timeout=15,
-    )
+    d = _binance_get(f"/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}")
     bars = []
     for k in d or []:
         try:
