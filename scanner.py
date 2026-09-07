@@ -1262,9 +1262,13 @@ def run_market_scan(full: bool = True, top: int = MARKET_TOP,
             done += 1
             if progress and done % 100 == 0:
                 progress(f"深度计算 {done}/{total}，已有效 {len(rows)} 只")
-            if done % 300 == 0:          # 断点保护：每 300 只落盘一次
-                _save_market(sorted(rows, key=lambda r: r.get("score") or 0, reverse=True),
-                             stocks, hot_topics, done, total, final=False)
+            if done % 300 == 0:          # 断点保护：每 300 只落盘一次（失败不静默）
+                try:
+                    _save_market(sorted(rows, key=lambda r: r.get("score") or 0, reverse=True),
+                                 stocks, hot_topics, done, total, final=False)
+                except Exception as exc:
+                    if progress:
+                        progress(f"断点落盘失败（data 目录不可写？）: {str(exc)[:120]}")
 
     def one(s: dict):
         try:

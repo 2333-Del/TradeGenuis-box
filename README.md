@@ -115,6 +115,8 @@ python3 scanner.py --push        # 扫描并推送
 ## Docker 部署（服务器）
 
 ```bash
+# 0. 确保数据目录存在（git clone 出来的仓库里没有它，缺了会导致扫描结果落盘失败）
+mkdir -p data
 # 1. 改密码：编辑 docker-compose.yml 里的 DASHBOARD_PASSWORD
 # 2. 构建并启动
 docker compose up -d --build
@@ -122,8 +124,8 @@ docker compose up -d --build
 docker compose logs -f
 ```
 
-- 访问 `http://服务器IP:8808`，先输密码登录（HttpOnly 会话 Cookie，重启容器后需重新登录）
-- 基础镜像走 `docker.aityp.com` 镜像站、pip 走清华源（已写死在 Dockerfile，国内服务器直接 build）
+- 访问 `http://服务器IP:12300`（端口改 compose 里的 `ports` 映射，左边对外/右边 8808 是容器内固定端口），先输密码登录
+- 基础镜像走华为云镜像站（swr.cn-north-4）、pip 走清华源（已写死在 Dockerfile，国内服务器直接 build）
 - `./data` 挂载到容器内持久化：扫描结果、自选池、universe/ETF/概念缓存、配置
 - 不设置 `DASHBOARD_PASSWORD` 时服务只允许本机访问（容器场景等于全部拒绝），公网部署必设
 - 建议由 Nginx/Caddy 反代加 HTTPS 后再暴露公网；compose 里可把端口绑定改为 `127.0.0.1:8808:8808`
