@@ -1,0 +1,20 @@
+services:
+  dashboard:
+    # 构建：上下文为仓库根（Dockerfile 的 COPY 源码相对根目录），Dockerfile 在 docker/ 下
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: tradegenuis
+    restart: unless-stopped
+    ports:
+      # 左边是对外端口（可改成任意不显眼端口），右边 8808 是容器内固定端口，不用动
+      # 对公网开放前建议改为 "127.0.0.1:12300:8808"，由 Nginx/Caddy 反代加 HTTPS
+      - "12300:8808"
+    environment:
+      # 必改：外网访问密码。不设置时服务只允许本机访问（容器内等于全部拒绝）
+      DASHBOARD_PASSWORD: "change-me-please"
+      # Telegram 推送（可选）
+      # TG_BOT_TOKEN: ""
+      # TG_CHAT_ID: ""
+    volumes:
+      - ../data:/app/data   # 扫描结果/缓存/自选池/配置 持久化在仓库根 data/（相对本文件）

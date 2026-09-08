@@ -76,6 +76,10 @@
     .mode-tag { font-family: var(--mono); font-size: 11px; color: var(--ink-faint); }
     #hotTopics { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-left: auto; font-size: 11.5px; color: var(--ink-dim); }
     .hot-chip { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); background: var(--chip); border: 1px solid var(--card-border); border-radius: 999px; padding: 2px 9px; white-space: nowrap; cursor: pointer; transition: color .15s, border-color .15s, background .15s; }
+    .res-chip { font-family: var(--mono); font-size: 11px; color: var(--ink-dim); background: var(--chip); border: 1px solid var(--card-border); border-radius: 999px; padding: 2px 9px; white-space: nowrap; cursor: pointer; margin-left: 4px; }
+    .res-chip.sel { color: var(--ink); border-color: rgba(229,212,182,.45); background: rgba(229,212,182,.14); }
+    .res-chip[data-res="strong"] b { color: #8FC98B; }
+    .res-chip b { font-weight: 600; }
     .hot-chip:hover { color: var(--ink); border-color: var(--ink-faint); }
     .hot-chip.sel { color: var(--mint-ink); background: var(--up); border-color: var(--up); font-weight: 600; }
     .hot-chip .h-chg { font-size: 10px; }
@@ -191,8 +195,13 @@
 <script>
 "use strict";
 const periods = ["30m", "1h", "1d"];
+const CARD_LIMIT = 60;   // 默认渲染卡面上限（每张卡带canvas图表，全量渲染几百张会卡死页面）
+const S = { watch: null, crypto: null, status: null, cfg: null, hot: [], loaded: false, kbars: {}, market: "stock", selBoard: null, resFilter: null, cardLimit: CARD_LIMIT };
+// 图表懒加载：滚动到可视区附近才请求K线
+const chartIO = ("IntersectionObserver" in window) ? new IntersectionObserver(entries => {
+  for (const e of entries) if (e.isIntersecting) { chartIO.unobserve(e.target); loadChart(e.target.dataset.code); }
+}, { rootMargin: "300px" }) : null;
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;", "'":"&#39;"}[c]));
-const S = { watch: null, crypto: null, status: null, cfg: null, hot: [], loaded: false, kbars: {}, market: "stock", selBoard: null };
 const $ = id => document.getElementById(id);
 const fmt2 = v => (v === null || v === undefined || isNaN(v)) ? "—" : Number(v).toFixed(2);
 const fmtc = v => (v === null || v === undefined || isNaN(v)) ? "—" : (v >= 1 ? Number(v).toFixed(2) : Number(v).toPrecision(4));
@@ -249,7 +258,15 @@ function renderAll() {
   } else if (S.selBoard) {
     $("cardsTitle").innerHTML = `板块「${S.selBoard}」 <span class="plan-count" id="poolCount" data-board-count>—</span>`;
   } else {
-    $("cardsTitle").innerHTML = `A股共振信号 <span class="plan-count" id="poolCount">${S.loaded ? hits.length : ""}</span> <span class="mode-tag" style="color:var(--up)">达标 ${hits.length}</span>`;
+    const counts = { strong: 0, soft: 0, near: 0 };
+    rows.forEach(r => { if (r.resonance_level in counts) counts[r.resonance_level]++; });
+    const total = counts.strong + counts.soft + counts.near;
+    $("cardsTitle").innerHTML = `A股共振信号
+      <span class="res-chip${!S.resFilter ? ' sel' : ''}" data-res="">全部 ${total}</span>
+      <span class="res-chip${S.resFilter === 'strong' ? ' sel' : ''}" data-res="strong">强 ${counts.strong}</span>
+      <span class="res-chip${S.resFilter === 'soft' ? ' sel' : ''}" data-res="soft">准 ${counts.soft}</span>
+      <span class="res-chip${S.resFilter === 'near' ? ' sel' : ''}" data-res="near">临界 ${counts.near}</span>
+      <span class="mode-tag" style="color:var(--up)">达标 ${hits.length}</span>`;
   }
   // A股：展示当前热门板块（可点击筛选）；接口限流则诚实提示
   const hotEl = $("hotTopics");
@@ -300,18 +317,26 @@ function renderCards(rows) {
     const cnt = document.querySelector("[data-board-count]");
     if (cnt) cnt.textContent = shown.length;
   } else {
-    // 共振信号视图：强/准/临界全部展示（强在前）；qualified 不再是唯一入口
+    // 共振信号视图：按级别排序；可按级别筛选；渲染卡面上限 CARD_LIMIT（图表懒加载）
     const rank = { strong: 0, soft: 1, near: 2 };
-    shown = rows.filter(r => r.qualified || ["soft", "near"].includes(r.resonance_level))
+    let sig = rows.filter(r => r.qualified || ["soft", "near"].includes(r.resonance_level))
       .sort((a, b) => (rank[a.resonance_level] ?? 3) - (rank[b.resonance_level] ?? 3) || (b.score || 0) - (a.score || 0));
+    if (S.resFilter) sig = sig.filter(r => r.resonance_level === S.resFilter);
+    shown = sig.slice(0, S.cardLimit);
+    S._sigTotal = sig.length;
   }
   if (!shown.length) {
-    box.innerHTML = `<div class="empty"><div class="big">NO SIGNAL</div><p>${S.selBoard ? `该板块暂无股票` : isCrypto ? "暂无数据" : rows.some(r => r.resonance_status === "数据不可用") ? "行情获取失败，暂无已确认共振标的" : rows.some(r => !r.resonance_status) ? "待重新扫描：旧结果尚未评估共振" : "暂无多周期共振标的"}</p>
+    box.innerHTML = `<div class="empty"><div class="big">NO SIGNAL</div><p>${S.selBoard ? `该板块暂无股票` : isCrypto ? "暂无数据" : rows.some(r => r.resonance_status === "数据不可用") ? "行情获取失败，暂无已确认共振标的" : rows.some(r => !r.resonance_status || r.resonance_status.startsWith("待重新扫描")) ? "待重新扫描：旧结果尚未评估共振" : "暂无多周期共振标的"}</p>
       <button class="act go" type="button" onclick="doScan()">${isCrypto ? "币圈扫描" : "全市场扫描"}</button></div>`;
     return;
   }
-  box.innerHTML = shown.map((r, i) => cardHTML(r, i)).join("");
-  shown.forEach(r => loadChart(r.code));
+  const more = (!isCrypto && !S.selBoard && S._sigTotal > shown.length)
+    ? `<div class="empty" style="padding:14px"><p>共 ${S._sigTotal} 只信号，已展示 ${shown.length} 只</p><button class="act" type="button" id="loadMore">加载更多</button></div>` : "";
+  box.innerHTML = shown.map((r, i) => cardHTML(r, i)).join("") + more;
+  const moreButton = $("loadMore");
+  if (moreButton) moreButton.onclick = () => { S.cardLimit += CARD_LIMIT; renderAll(); };
+  if (chartIO) box.querySelectorAll("canvas[data-code]").forEach(cv => chartIO.observe(cv));
+  else shown.forEach(r => loadChart(r.code));   // 老浏览器退化：只加载首屏之外不主动拉
 }
 
 function cardHTML(r, i) {
@@ -338,11 +363,11 @@ function cardHTML(r, i) {
       ];
   const price = isCrypto ? fmtc(r.price) : fmt2(r.price);
   const chgText = signOf(r.chg, S.market) + "%";
-  // 共振分级徽标：强共振（推送）/ 准共振（推送或评分不足）/ 临界（次日跟踪）
+  // 共振分级徽标：强共振（推送）/ 准共振（推送或量价未确认）/ 临界（次日跟踪）
   const stateName = { BREAK: "突破", NEAR: "临界", INSIDE: "箱内", BELOW: "箱下", NA: "—" };
   const qBadge = r.resonance_level === "strong" ? '<span class="q-badge">强共振</span>'
     : r.resonance_level === "soft" && r.qualified ? '<span class="q-badge soft">准共振</span>'
-    : r.resonance_level === "soft" ? '<span class="q-badge soft">准共振·分不足</span>'
+    : r.resonance_level === "soft" ? '<span class="q-badge soft">准共振·量价未确认</span>'
     : r.resonance_level === "near" ? '<span class="q-badge near">临界</span>' : "";
   const resClass = { BREAK: "", NEAR: "warn", INSIDE: "no", BELOW: "no", NA: "no" };
   const tfSpan = p => {
@@ -350,7 +375,7 @@ function cardHTML(r, i) {
     const st = f?.state;
     if (!st) return `<span class="no">${p} · ${esc(r.resonance_status || '待重新扫描')}</span>`;
     const dist = f.dist_pct != null ? ` ${f.dist_pct >= 0 ? "+" : ""}${f.dist_pct.toFixed(1)}%` : "";
-    return `<span class="${resClass[st] || 'no'}">${p}·${stateName[st] || st}${dist}</span>`;
+    return `<span class="${resClass[st] ?? 'no'}">${p}·${stateName[st] || st}${dist}</span>`;
   };
   return `<article class="sig${r.qualified ? ' q' : ''}" data-code="${r.code}" data-market="${S.market}" style="animation-delay:${Math.min(i * 50, 400)}ms">
     <div class="sig-top">
@@ -484,7 +509,9 @@ async function refreshQuotes() {
   if (!S.loaded) return;
   const data = S.market === "crypto" ? (S.crypto || {}) : (S.watch || {});
   const rows = data.candidates || [];
-  const codes = rows.filter(r => r.qualified || ["soft", "near"].includes(r.resonance_level)).map(r => r.code);
+  const cards = Array.from(document.querySelectorAll('.sig[data-code]'));
+  const visible = cards.filter(card => { const b = card.getBoundingClientRect(); return b.bottom >= 0 && b.top <= window.innerHeight; });
+  const codes = Array.from(new Set(visible.map(card => card.dataset.code))).slice(0, 100);
   if (!codes.length || S.market === "crypto") return;  // 币圈价格在扫描时已定格，3s 刷新仅 A股
   try {
     const qs = await jfetch("api/quotes?codes=" + codes.join(","));
@@ -512,15 +539,18 @@ async function doScan() {
   try {
     const r = await jfetch("api/scan", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode }) });
-    if (r.status === "running") toast("扫描已在进行中");
-    for (let i = 0; i < 200; i++) {
-      await new Promise(res => setTimeout(res, 3000));
-      const st = await jfetch("api/status");
-      S.status = st;
-      if (!st.scanning) { await refresh(); toast("扫描完成"); break; }
+    if (r.status === "started" || r.status === "running") {
+      if (r.status === "running") toast("扫描已在进行中，等待完成…（全市场约20-40分钟）");
+      for (let i = 0; i < 800; i++) {          // 轮询至扫描完成（全市场最长约40分钟）
+        await new Promise(res => setTimeout(res, 3000));
+        const st = await jfetch("api/status");
+        S.status = st;
+        $("btnScan").textContent = `扫描中…${st.scan_log.length ? st.scan_log[st.scan_log.length - 1].slice(-46) : ""}`;
+        if (!st.scanning) { await refresh(); toast("扫描完成"); break; }
+      }
     }
   } catch (e) {
-    toast("扫描失败");
+    toast("扫描失败（若控制台有红色报错请截图反馈）");
   }
   scanning = false; $("btnScan").disabled = false; $("btnScan").textContent = S.market === "crypto" ? "币圈扫描" : "全市场扫描";
 }
@@ -537,12 +567,11 @@ async function saveCfg() {
 function switchMarket(market) {
   if (S.market === market) return;
   S.market = market;
+  S.cardLimit = CARD_LIMIT;
   S.kbars = {};
   if (market === "crypto") S.selBoard = null;   // 板块筛选仅 A股
   $("btnScan").textContent = market === "crypto" ? "币圈扫描" : "全市场扫描";
-  renderAll();
-  const data = market === "crypto" ? (S.crypto || {}) : (S.watch || {});
-  (data.candidates || []).filter(r => r.qualified || ["soft", "near"].includes(r.resonance_level)).slice(0, 30).forEach(r => loadChart(r.code));
+  renderAll();   // 卡片与图表懒加载由 renderCards 统一处理
 }
 
 /* =============================== 启动 =============================== */
@@ -554,12 +583,19 @@ function boot() {
   document.querySelectorAll("#marketTabs .tab").forEach(t => {
     t.addEventListener("click", () => switchMarket(t.dataset.market));
   });
+  $("btnScan").addEventListener("click", () => doScan());
   // 热门板块点击筛选
   $("hotTopics").addEventListener("click", e => {
-    const chip = e.target.closest(".hot-chip[data-board]");
-    if (!chip) return;
+    const chip = e.target.closest(".hot-chip[data-board]"); if (!chip) return;
     const board = chip.dataset.board;
     S.selBoard = (S.selBoard === board) ? null : board;
+    renderAll();
+  });
+  // 共振级别筛选（全部/强/准/临界）
+  $("cardsTitle").addEventListener("click", e => {
+    const chip = e.target.closest(".res-chip[data-res]"); if (!chip) return;
+    S.resFilter = chip.dataset.res || null;
+    S.cardLimit = CARD_LIMIT;
     renderAll();
   });
   $("autoCb").addEventListener("change", () => saveCfg());

@@ -28,6 +28,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+from collections import Counter
 import json
 import re
 import sys
@@ -39,6 +41,8 @@ from pathlib import Path
 
 import requests
 import resonance as rs
+import notifications
+from market_data import daily as closed_daily, factor_drift
 
 try:
     import ths  # 同花顺第三数据源（d.10jqka.com.cn，无需 cookie）
@@ -76,6 +80,9 @@ FUND_INFLOW_REQ = 3     # 近5日主力净流入≥3天
 HOLDER_HIGH = -2.0      # 股东户数环比 ≤ -2% → 高控盘
 HOLDER_MID = 0.5        # ≤ 0.5% → 中控盘，否则偏低
 TURNOVER_CAP = 15.0     # 换手率超 15% 视为分歧大，控盘降级
+M30_BACKOFF = 1.5       # 分钟源之间退避秒数（防瞬时故障时的紧密重试）
+EXDIV_WINDOW = 20       # 除权检测观察窗（交易日，覆盖 1h 箱体 60+8 根 ≈ 17 日）
+EXDIV_DRIFT_EPS = 0.003 # 复权因子漂移阈值（0.3%，高于 2 位小数报价噪声）
 
 # --------------------------------------------------------------------------- #
 # HTTP 会话（自动重试）
@@ -150,23 +157,18 @@ def fetch_quote(code: str) -> dict:
     except Exception:
         pass
     # 腾讯兜底（GBK 文本，~ 分隔）
-    r = HTTP.get(f"https://qt.gtimg.cn/q={tx_symbol(code)}", timeout=8)
-    p = r.content.decode("gbk", errors="ignore").split("~")
-    if len(p) < 40 or not p[3]:
-        # 同花顺兜底
+    try:
+        r = HTTP.get(f"https://qt.gtimg.cn/q={tx_symbol(code)}", timeout=8)
+        r.raise_for_status()
+        p = r.content.decode("gbk", errors="ignore").split("~")
+        if len(p) < 50 or not p[3] or float(p[3]) <= 0:
+            raise ValueError("quote empty (tencent)")
+        return {"price": float(p[3]), "chg": float(p[32]), "name": p[1],
+                "turnover": float(p[38]), "volume_ratio": float(p[49])}
+    except Exception:
         if ths is not None:
-            try:
-                return ths.fetch_quote(code)
-            except Exception:
-                pass
-        raise RuntimeError("quote empty (tencent)")
-    return {
-        "price": float(p[3]),
-        "chg": float(p[32]),
-        "name": p[1],
-        "turnover": float(p[38]),
-        "volume_ratio": float(p[49]),
-    }
+            return ths.fetch_quote(code)
+        raise
 
 
 def fetch_kline(code: str, lmt: int = 160) -> list[dict]:
@@ -190,7 +192,7 @@ def fetch_kline(code: str, lmt: int = 160) -> list[dict]:
             except (ValueError, IndexError):
                 continue
         if len(bars) >= 30:
-            return bars
+            return closed_daily(bars, source="tencent", adjustment="qfq" if node.get("qfqday") else "unadjusted")
     except Exception:
         pass
     # 新浪兜底
@@ -206,7 +208,7 @@ def fetch_kline(code: str, lmt: int = 160) -> list[dict]:
                 "high": float(k["high"]), "low": float(k["low"]), "vol": float(k["volume"]),
             })
         if len(bars) >= 30:
-            return bars
+            return closed_daily(bars, source="sina", adjustment="unadjusted")
     except Exception:
         pass
     # 同花顺兜底（不复权，近期无除权时与复权价一致，形态判断可用）
@@ -219,7 +221,7 @@ def fetch_kline(code: str, lmt: int = 160) -> list[dict]:
 
 
 EM_UT = "b2884a393a59ad64002292a3e90d46a5"
-_EM_FLOW_DOWN = False  # 东财 daykline 连续失败后本次进程直接走新浪兜底
+_EM_FLOW_DOWN = 0.0  # 单调时钟冷却截止时刻，常驻进程可以恢复主源
 
 
 def _flow_fresh(out: list[dict]) -> bool:
@@ -240,7 +242,7 @@ def fetch_fund_flow(code: str, days: int = FUND_DAYS + 6) -> list[dict]:
     """
     f2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
     global _EM_FLOW_DOWN
-    if not _EM_FLOW_DOWN:
+    if time.monotonic() >= _EM_FLOW_DOWN:
         try:
             d = (em.get_json(em.PUSH2HIS, "/api/qt/stock/fflow/daykline/get", {
                 "lmt": 0, "klt": 101, "secid": secid(code),
@@ -254,9 +256,9 @@ def fetch_fund_flow(code: str, days: int = FUND_DAYS + 6) -> list[dict]:
             out.sort(key=lambda x: x["date"])
             if _flow_fresh(out):
                 return out[-days:]
-            _EM_FLOW_DOWN = True
+            _EM_FLOW_DOWN = time.monotonic() + 120
         except Exception:
-            _EM_FLOW_DOWN = True
+            _EM_FLOW_DOWN = time.monotonic() + 120
     # 新浪兜底：主力 = 超大单(r0_net) + 大单(r1_net)，返回为倒序（新→旧）
     try:
         d = http_json(
@@ -350,7 +352,10 @@ def fetch_concept_boards() -> list[dict]:
             return boards
     except Exception:
         pass
-    return _concept_boards_sina()
+    try:
+        return _concept_boards_sina()
+    except Exception:
+        return []
 
 
 def fetch_hot_topics(topn: int = HOT_TOP_N) -> tuple[list[dict], set[str]]:
@@ -628,45 +633,120 @@ def score_row(row: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # 扫描主流程
 # --------------------------------------------------------------------------- #
+def _m30_tencent(sym: str):
+    """腾讯 m30 主源：[date, open, close, high, low, vol(手)]，时间戳=结束时刻；
+    盘中含未来时间戳的半根K，由 rs.aggregate 的 cutoff 过滤。"""
+    data = http_json(
+        f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={sym},m30,,{rs.LIMIT}")
+    node = (data.get("data") or {}).get(sym) or {}
+    raw = node.get("m30") or []
+    if not raw:
+        raise ValueError("分钟行情为空(腾讯)")
+    quote_at = datetime.strptime(node["qt"][sym][30], "%Y%m%d%H%M%S").replace(tzinfo=BJT)
+    return raw, quote_at, "tencent_m30"
+
+
+def _m30_sina(sym: str):
+    """新浪 30m 第二源：时间戳同为结束时刻（实测与 SLOTS 逐一对应）；
+    volume 单位为股，除以 100 统一为手（与腾讯对齐，仅用于展示）。"""
+    d = http_json(
+        "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+        f"CN_MarketData.getKLineData?symbol={sym}&scale=30&ma=no&datalen={rs.LIMIT}")
+    raw = []
+    for b in d or []:
+        try:
+            stamp = str(b["day"]).replace("-", "").replace(":", "").replace(" ", "")[:12]
+            datetime.strptime(stamp, "%Y%m%d%H%M")   # 格式闸门，异常条直接丢弃
+            raw.append([stamp, float(b["open"]), float(b["close"]), float(b["high"]),
+                        float(b["low"]), float(b["volume"]) / 100.0])
+        except (KeyError, ValueError, TypeError):
+            continue
+    if not raw:
+        raise ValueError("分钟行情为空(新浪)")
+    quote_at = datetime.strptime(str(raw[-1][0]), "%Y%m%d%H%M").replace(tzinfo=BJT)
+    return raw, quote_at, "sina_m30"
+
+
+def _m30_em(code: str, sym: str):
+    """东财 30m 末位兜底：klines 'yyyy-MM-dd HH:mm,o,c,h,l,v(手)'。
+    该路径在部分网络环境被路径级重置（见 em.py 头注），失败即放弃本源。"""
+    if em is None:
+        raise ValueError("em 模块不可用")
+    d = em.minute_kline_raw(code, 1 if sym.startswith("sh") else 0)
+    lines = ((d.get("data") or {}).get("klines")) or []
+    raw = []
+    for line in lines:
+        p = str(line).split(",")
+        try:
+            stamp = p[0].replace("-", "").replace(":", "").replace(" ")[:12]
+            datetime.strptime(stamp, "%Y%m%d%H%M")
+            raw.append([stamp, float(p[1]), float(p[2]), float(p[3]),
+                        float(p[4]), float(p[5])])
+        except (IndexError, ValueError, TypeError):
+            continue
+    if not raw:
+        raise ValueError("分钟行情为空(东财)")
+    quote_at = datetime.strptime(str(raw[-1][0]), "%Y%m%d%H%M").replace(tzinfo=BJT)
+    return raw, quote_at, "em_m30"
+
+
 def fetch_stock_timeframes(code: str, as_of: datetime,
                            daily_bars: list[dict] | None = None) -> dict:
-    """30m/1h 用同源未复权分钟行情；1d 优先用日K（mkline 历史深度会被截断，
-    聚合日线凑不满箱体窗口，日K才是稳定口径）。不复用此前扫描缓存。"""
+    """30m/1h 用同源未复权分钟行情（腾讯主源 → 新浪 → 东财，源间退避兜底）；
+    1d 优先用日K（mkline 历史深度会被截断，聚合日线凑不满箱体窗口，日K才是稳定口径）。
+    不复用此前扫描缓存。"""
     sym = tx_symbol(code)
-    error = None
-    for attempt in range(2):
+    cutoff = as_of.astimezone(BJT)
+    errors: list[str] = []
+    sources = (lambda: _m30_tencent(sym),
+               lambda: _m30_sina(sym),
+               lambda: _m30_em(code, sym))
+    for index, fetch in enumerate(sources):
         try:
-            data = http_json(
-                f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={sym},m30,,{rs.LIMIT}")
-            node = data["data"][sym]
-            raw = node.get("m30") or []
-            if not raw:
-                raise ValueError("分钟行情为空")
-            quote_at = datetime.strptime(node["qt"][sym][30], "%Y%m%d%H%M%S").replace(tzinfo=BJT)
-            cutoff = as_of.astimezone(BJT)
+            raw, quote_at, source = fetch()
             if (cutoff - quote_at).total_seconds() > 7 * 86400:
                 raise ValueError("行情时间过旧")
             if cutoff.weekday() < 5 and cutoff.strftime("%H:%M") >= "10:00" and quote_at.date() < cutoff.date():
                 raise ValueError("缺少当日行情（休市或停牌时不确认）")
             frames = rs.snapshot(raw, cutoff)
-            if daily_bars and len(daily_bars) >= rs.LOOKBACK + rs.RECENT["1d"]:
-                frames["1d"] = dict(rs.evaluate(daily_bars, rs.RECENT["1d"]), bars=daily_bars)
-            reference = cutoff if cutoff.date() == quote_at.date() else min(cutoff, quote_at)
-            expected = [slot for slot in rs.SLOTS if slot <= reference.strftime("%H:%M")]
-            if expected:
-                latest = reference.strftime("%Y-%m-%d") + "T" + expected[-1]
-                if not frames["30m"]["bars"] or not frames["30m"]["bars"][-1]["date"].startswith(latest):
-                    raise ValueError("最新已收盘分钟行情缺失")
-            return frames
+            break
         except Exception as exc:
-            error = exc
-    raise RuntimeError(f"分钟行情不可用: {error}")
+            errors.append(f"{type(exc).__name__}: {exc}")
+            if index < len(sources) - 1:
+                time.sleep(M30_BACKOFF)
+    else:
+        raise RuntimeError("分钟行情不可用(腾讯/新浪/东财): " + " | ".join(errors)[:150])
+    # ---- 以下与分钟源无关：失败即终局，换源重试没有意义（统一 RuntimeError 契约） ----
+    if daily_bars is None:
+        daily_bars = fetch_kline(code)
+    closed = closed_daily(daily_bars, cutoff)
+    # 不复权兜底仅用于展示/质量评分，不能静默替代前复权共振日线。
+    if closed.adjustment == "unadjusted":
+        raise RuntimeError("日线源为不复权，无法确认前复权信号: " + closed.source)
+    full_days = frames["1d"]["bars"]
+    if not closed or (full_days and closed[-1]["date"] < full_days[-1]["date"][:10]):
+        raise RuntimeError("最新已收盘日线缺失")
+    # 除权防御：30m/1h 是未复权序列，观察窗内复权因子漂移 → 分钟箱体已被跳空污染
+    drift, detectable = factor_drift(full_days, closed, window=EXDIV_WINDOW)
+    if detectable and drift is not None and drift > EXDIV_DRIFT_EPS:
+        raise RuntimeError(f"分钟窗口内疑似除权除息(因子漂移{drift:+.2%})，跳过共振确认")
+    frames["1d"] = dict(rs.evaluate(closed, rs.RECENT["1d"]), bars=closed,
+                        source=closed.source, adjustment=closed.adjustment, closed=True)
+    for p in ("30m", "1h"):
+        frames[p].update(source=source, adjustment="unadjusted", closed=True)
+    reference = cutoff if cutoff.date() == quote_at.date() else min(cutoff, quote_at)
+    expected = [slot for slot in rs.SLOTS if slot <= reference.strftime("%H:%M")]
+    if expected:
+        latest = reference.strftime("%Y-%m-%d") + "T" + expected[-1]
+        if not frames["30m"]["bars"] or not frames["30m"]["bars"][-1]["date"].startswith(latest):
+            raise ValueError("最新已收盘分钟行情缺失")
+    return frames
 
 
 def apply_resonance(row: dict, as_of: datetime,
                     daily_bars: list[dict] | None = None) -> dict:
     """共振是主筛：池内全体评估（评分只是质量排序，不再 gate 共振评估）。"""
-    row = dict(row, resonance_as_of=as_of.isoformat(), resonance_source="tencent_m30_unadjusted")
+    row = dict(row, resonance_as_of=as_of.isoformat(), resonance_source="per_timeframe", resonance_version=2)
     row["timeframes"] = {}
     row["resonance_status"] = "数据不可用"
     try:
@@ -698,7 +778,8 @@ def analyze(code: str, name: str, theme_hint: str,
             hot_names: set[str], as_of: datetime | None = None) -> dict:
     """分析单只股票：拉全量数据 + 四条件计算。"""
     q = fetch_quote(code)
-    bars = fetch_kline(code)
+    as_of = as_of or datetime.now(BJT)
+    bars = closed_daily(fetch_kline(code), as_of)
     ffs = fetch_fund_flow(code)
     holder = fetch_holder(code)
 
@@ -833,6 +914,36 @@ def _mkt_cache_save() -> None:
             pass
 
 
+def refresh_universe_quotes(stocks: list[dict]) -> list[dict]:
+    """只复用证券清单；批量刷新动态字段，失败时置空而非冒充新行情。"""
+    out = []
+    for i in range(0, len(stocks), 50):
+        batch = stocks[i:i + 50]
+        quotes = {}
+        try:
+            response = HTTP.get("https://qt.gtimg.cn/q=" + ",".join(tx_symbol(s["code"]) for s in batch), timeout=8)
+            response.raise_for_status()
+            for line in response.content.decode("gbk", errors="ignore").split(";"):
+                p = line.split("~")
+                if len(p) < 50:
+                    continue
+                try:
+                    stamp = datetime.strptime(p[30], "%Y%m%d%H%M%S").replace(tzinfo=BJT)
+                    if float(p[3]) <= 0:
+                        continue
+                    quotes[p[2]] = dict(price=float(p[3]), chg=float(p[32]), turnover=float(p[38]),
+                                         vr=float(p[49]), quote_at=stamp.isoformat(), quote_source="tencent")
+                except (ValueError, IndexError):
+                    continue
+        except Exception:
+            pass
+        for s in batch:
+            q = quotes.get(s["code"])
+            out.append(dict(s, **(q or dict(price=None, chg=None, turnover=0.0, vr=0.0,
+                                            quote_at=None, quote_source="unavailable"))))
+    return out
+
+
 def fetch_universe(force: bool = False) -> list[dict]:
     """沪深全部 A 股列表，按日缓存。主源东财 clist（含量比），兜底新浪（无量比）。"""
     today = datetime.now(BJT).strftime("%Y-%m-%d")
@@ -840,12 +951,13 @@ def fetch_universe(force: bool = False) -> list[dict]:
         try:
             d = json.loads(UNIVERSE_FILE.read_text(encoding="utf-8"))
             if d.get("as_of") == today and d.get("stocks"):
-                return d["stocks"]
+                return refresh_universe_quotes(d["stocks"])
         except Exception:
             pass
     stocks = _universe_em() or _universe_sina()
     if not stocks:
         raise RuntimeError("股票清单获取失败（东财 clist 与新浪均不可用）")
+    stocks = refresh_universe_quotes(stocks)
     DATA.mkdir(parents=True, exist_ok=True)
     UNIVERSE_FILE.write_text(
         json.dumps({"as_of": today, "total": len(stocks), "stocks": stocks},
@@ -962,7 +1074,7 @@ def screen_universe(stocks: list[dict], top: int | None = None,
     剔除涨停（无法接力）与低价股；自选池保送。top=None 时不限量。
     """
     def active(s):
-        if s["price"] <= 2 or not 0 < s["chg"] < 9.8:
+        if (s.get("price") or 0) <= 2 or not 0 < (s.get("chg") or 0) < 9.8:
             return False
         return (s["chg"] >= ACTIVE_CHG or s["turnover"] >= ACTIVE_TURNOVER
                 or s.get("vr", 0) >= ACTIVE_VR)
@@ -972,7 +1084,7 @@ def screen_universe(stocks: list[dict], top: int | None = None,
     picked = cands if not top else cands[:top]
     have = {s["code"] for s in picked}
     for s in stocks:                     # 自选池保送
-        if s["code"] in pool_codes and s["code"] not in have and s["price"] > 0:
+        if s["code"] in pool_codes and s["code"] not in have and (s.get("price") or 0) > 0:
             picked.append(s)
             have.add(s["code"])
     return picked
@@ -984,7 +1096,7 @@ def _cached_concepts(code: str) -> list[str]:
     if ent and ent.get("t"):
         try:
             age = (datetime.now() - datetime.strptime(ent["t"], "%Y-%m-%d")).days
-            if age <= 30:
+            if age <= 30 and ent.get("names"):
                 return ent.get("names", [])
         except ValueError:
             pass
@@ -993,8 +1105,9 @@ def _cached_concepts(code: str) -> list[str]:
         names = fetch_concepts(code)
     except Exception:
         names = []
-    cache.setdefault("concepts", {})[code] = {"t": now_str()[:10], "names": names}
-    _mkt_cache_save()
+    if names:
+        cache.setdefault("concepts", {})[code] = {"t": now_str()[:10], "names": names}
+        _mkt_cache_save()
     return names
 
 
@@ -1003,8 +1116,8 @@ def _cached_holder(code: str) -> dict | None:
     ent = cache.get("holders", {}).get(code)
     if ent and ent.get("ratio") is not None:
         try:
-            age = (datetime.now() - datetime.strptime(ent["end_date"], "%Y-%m-%d")).days
-            if age <= 120:               # 财报期披露，季度内复用
+            age = time.time() - ent.get("fetched_at", 0)
+            if 0 <= age <= 86400:        # 每日至少检查一次新披露，不按报告期缓存120天
                 return ent
         except (ValueError, TypeError):
             pass
@@ -1013,8 +1126,10 @@ def _cached_holder(code: str) -> dict | None:
         h = fetch_holder(code)
     except Exception:
         h = None
-    cache.setdefault("holders", {})[code] = h or {"ratio": None, "end_date": now_str()[:10]}
-    _mkt_cache_save()
+    if h:
+        h["fetched_at"] = time.time()
+        cache.setdefault("holders", {})[code] = h
+        _mkt_cache_save()
     return h
 
 
@@ -1024,7 +1139,7 @@ def fetch_etf_universe(force: bool = False) -> list[dict]:
     if not force and ETF_UNIVERSE_FILE.exists():
         try:
             d = json.loads(ETF_UNIVERSE_FILE.read_text(encoding="utf-8"))
-            if d.get("as_of") == today and d.get("etfs"):
+            if d.get("as_of") == today and d.get("etfs") and time.time() - d.get("fetched_at", 0) < 60:
                 return d["etfs"]
         except Exception:
             pass
@@ -1081,7 +1196,7 @@ def fetch_etf_universe(force: bool = False) -> list[dict]:
         try:
             DATA.mkdir(parents=True, exist_ok=True)
             ETF_UNIVERSE_FILE.write_text(
-                json.dumps({"as_of": today, "total": len(etfs), "etfs": etfs},
+                json.dumps({"as_of": today, "fetched_at": time.time(), "total": len(etfs), "etfs": etfs},
                            ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
@@ -1094,7 +1209,8 @@ def analyze_etf(s: dict, as_of: datetime | None = None) -> dict | None:
     ETF 无概念/股东户数/主力资金，硬套四条件会复刻「达标 0」。
     """
     try:
-        bars = fetch_kline(s["code"])
+        as_of = as_of or datetime.now(BJT)
+        bars = closed_daily(fetch_kline(s["code"]), as_of)
         if len(bars) < 40:
             return None
         vol = compute_volume(bars)
@@ -1145,7 +1261,8 @@ def analyze_etf(s: dict, as_of: datetime | None = None) -> dict | None:
 def analyze_market(s: dict, hot_names: set[str], as_of: datetime | None = None) -> dict | None:
     """对粗筛候选做全量四条件计算；数据不足返回 None（不占位）。"""
     try:
-        bars = fetch_kline(s["code"])
+        as_of = as_of or datetime.now(BJT)
+        bars = closed_daily(fetch_kline(s["code"]), as_of)
         if len(bars) < 40:
             return None
         ffs = fetch_fund_flow(s["code"])
@@ -1180,7 +1297,7 @@ def analyze_market(s: dict, hot_names: set[str], as_of: datetime | None = None) 
             "theme_hint": "", "theme_ok": theme_ok,
             "hot_boards": hot_boards, "concepts": concepts,
             "bar_date": bars[-1]["date"],
-            "as_of_quote": now_str(),
+            "as_of_quote": s.get("quote_at"), "quote_source": s.get("quote_source", "unavailable"),
         }
         return apply_resonance(score_row(row), as_of or datetime.now(BJT), daily_bars=bars)
     except Exception:
@@ -1190,7 +1307,7 @@ def analyze_market(s: dict, hot_names: set[str], as_of: datetime | None = None) 
 def _save_market(rows: list[dict], stocks: list[dict], hot_topics: list[dict],
                  done: int, total: int, final: bool) -> None:
     # 全量K线只用于计算，落盘只留信号/高分行 + 尾部K线（否则 watchlist 会膨胀到几十 MB）
-    keep = [r for r in rows if (r.get("score") or 0) >= SAVE_MIN_SCORE
+    keep = [dict(r) for r in rows if (r.get("score") or 0) >= SAVE_MIN_SCORE
             or r.get("resonance_level") in ("strong", "soft", "near")]
     for r in keep:
         tf = r.get("timeframes")
@@ -1214,6 +1331,13 @@ def _save_market(rows: list[dict], stocks: list[dict], hot_topics: list[dict],
         "saved": len(keep),
         "scanned": done,
         "done": final,
+        "data_health": {
+            "evaluated": sum(r.get("resonance_status") == "已评估" for r in rows),
+            "unavailable": sum(r.get("resonance_status") == "数据不可用" for r in rows),
+            "analysis_failed": max(0, done - len(rows)),
+            "errors": dict(Counter(r.get("resonance_error", "unknown") for r in rows
+                                   if r.get("resonance_status") == "数据不可用")),
+        },
         "hot_topics": [{"code": b["code"], "name": b["name"],
                         "chg1": b["chg1"], "chg5": b["chg5"]} for b in hot_topics],
         "candidates": keep,
@@ -1235,10 +1359,15 @@ def run_market_scan(full: bool = True, top: int = MARKET_TOP,
         progress("拉取沪深 A 股全量清单（首次较慢，此后按日缓存）…")
     stocks = fetch_universe()
     pool_codes = {p["code"] for p in load_pool()}
-    picked = screen_universe(stocks, None if full else top, pool_codes)
-    if progress:
-        progress(f"全市场 {len(stocks)} 只 → 活跃池 {len(picked)} 只"
-                 f"（涨幅/换手/量比，自选池保送），开始并发深度计算（{workers} 线程）…")
+    if full:
+        picked = list(stocks)                     # 原版口径：全市场全部深度计算（无粗筛）
+        if progress:
+            progress(f"全市场 {len(stocks)} 只，全部深度计算+共振评估（{workers} 线程，约 20-40 分钟）…")
+    else:
+        picked = screen_universe(stocks, top, pool_codes)
+        if progress:
+            progress(f"全市场 {len(stocks)} 只 → 活跃池粗筛 {len(picked)} 只"
+                     f"（涨幅/换手/量比，自选池保送），开始深度计算（{workers} 线程）…")
 
     etf_picked: list[dict] = []
     etfs = fetch_etf_universe()
@@ -1294,7 +1423,7 @@ def run_market_scan(full: bool = True, top: int = MARKET_TOP,
 
     def rank(r):
         lvl = {"strong": 0, "soft": 1, "near": 2}.get(r.get("resonance_level"), 3)
-        return (-lvl, -(r.get("score") or 0), -(r.get("chg") or 0))
+        return (lvl, -(r.get("score") or 0), -(r.get("chg") or 0))
 
     rows.sort(key=rank)
     _save_market(rows, stocks, hot_topics, done, total, final=True)
@@ -1468,31 +1597,32 @@ def fmt_money(wan: float | None) -> str:
 def format_alert(rows: list[dict]) -> str:
     lines = [
         f"多周期共振箱体突破扫描  {now_str()}",
-        "强共振 = 1d突破 + 1h/30m确认 | 准共振 = 1d临界 + 小周期点火",
+        "强共振 = 日线突破 + 小周期突破/临界（非三个周期都突破）",
         "",
     ]
     rows = [rs.qualify(r) for r in rows]
     hits = [r for r in rows if r.get("qualified")]
-    watch = [r for r in rows if not r.get("qualified")
-             and r.get("resonance_level") in ("soft", "near") and (r.get("score") or 0) >= 70]
+    watch = []  # 临界仅在看板跟踪，不主动推送
 
     def item(r: dict) -> list[str]:
         px = f"{r['price']:.2f}" if r.get("price") else "—"
         chg = f"{r['chg']:+.2f}%" if r.get("chg") is not None else ""
-        box = f"{r['box_low']}–{r['box_high']}" if r.get("box_low") else "—"
         states = r.get("res_states") or {}
         tf = " ".join(f"{p}:{states.get(p) or '—'}" for p in ("30m", "1h", "1d"))
-        return [
+        lines = [
             f"  {r['name']} {r['code']}  {px} {chg}  评分{r['score']}  {r['mode']}",
-            f"    共振[{tf}] | 箱体 {box} | 倍量{r.get('volume_days', 0)}日"
+            f"    共振[{tf}] | 倍量{r.get('volume_days', 0)}日"
             f"(量比{r.get('volume_ratio', 0):.2f}) | 试盘{r.get('tests', 0)}次",
         ]
+        for p, f in (r.get("timeframes") or {}).items():
+            lines.append(f"    {p} 箱顶 {f.get('box_high')} | 突破 {f.get('breakout_at') or '—'} | 确认至 {f.get('confirmed_at') or '—'}")
+        return lines
 
     if not hits and not watch:
         lines.append("本日无共振信号。")
     else:
         if hits:
-            lines.append("【达标（强共振 / 准共振·评分≥70）】")
+            lines.append("【达标（强共振 / 准共振·量价确认）】")
             for r in hits:
                 lines += item(r)
             lines.append("")
@@ -1514,23 +1644,45 @@ def _tg_from_config() -> tuple[str, str]:
 
 
 def telegram_send(text: str) -> bool:
-    token = os_environ("TG_BOT_TOKEN") or os_environ("TELEGRAM_BOT_TOKEN")
-    chat = os_environ("TG_CHAT_ID") or os_environ("TELEGRAM_CHAT_ID")
-    if not token or not chat:
-        token, chat = _tg_from_config()
+    token, chat = telegram_credentials()
     if not token or not chat:
         print("未配置 TG_BOT_TOKEN / TG_CHAT_ID，跳过推送。", file=sys.stderr)
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        r = HTTP.post(url, json={"chat_id": chat, "text": text,
-                                 "disable_web_page_preview": True}, timeout=15)
-        ok = bool(r.ok and r.json().get("ok"))
-    except Exception as e:
-        print("Telegram 请求失败:", e, file=sys.stderr)
-        return False
-    print("Telegram:", "OK" if ok else (r.text[:200] if r else "no response"))
-    return ok
+    # 每块至多3500个UTF-16单元，兼容中文及emoji；不打印含Bot令牌的异常URL。
+    chunks, chunk, size = [], [], 0
+    for char in text:
+        width = len(char.encode("utf-16-le")) // 2
+        if size + width > 3500:
+            chunks.append("".join(chunk)); chunk, size = [], 0
+        chunk.append(char); size += width
+    if chunk:
+        chunks.append("".join(chunk))
+    for part in chunks:
+        try:
+            r = HTTP.post(url, json={"chat_id": chat, "text": part,
+                                     "disable_web_page_preview": True}, timeout=15)
+            if not (r.ok and r.json().get("ok")):
+                return False
+        except Exception:
+            print("Telegram 请求失败", file=sys.stderr)
+            return False
+    return True
+
+
+def telegram_credentials():
+    configured_token, configured_chat = _tg_from_config()
+    return (os_environ("TG_BOT_TOKEN") or os_environ("TELEGRAM_BOT_TOKEN") or configured_token,
+            os_environ("TG_CHAT_ID") or os_environ("TELEGRAM_CHAT_ID") or configured_chat)
+
+
+def push_scan(rows, scope="market"):
+    if not all(telegram_credentials()):
+        return True  # 未配置时不启动传输
+    if scope == "crypto":
+        return telegram_send(format_alert(rows))
+    return notifications.dispatch([rs.qualify(r) for r in rows], DATA / "telegram_state.json",
+                                  scope, telegram_send, format_alert)
 
 
 def os_environ(key: str) -> str:
@@ -1615,7 +1767,7 @@ def main() -> int:
         msg = format_alert(rows)
         if not args.cron:
             print(msg)
-        if not telegram_send(msg):
+        if not push_scan(rows, "crypto" if args.crypto else "market" if args.market else "pool"):
             return 1
     return 0
 

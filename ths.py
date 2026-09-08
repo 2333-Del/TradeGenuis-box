@@ -29,6 +29,7 @@ import time
 from datetime import datetime
 
 import requests
+from market_data import daily
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -107,13 +108,13 @@ def fetch_kline(code: str, lmt: int = 160) -> list[dict]:
                 "low": float(d.get("9") or 0), "close": float(d.get("11") or d.get("10") or 0),
                 "vol": float(d.get("13") or 0) / 100.0,  # 股 → 手
             }
-            if not bars or bars[-1]["date"] != bar["date"]:
-                if bar["close"] > 0:
-                    bars.append(bar)
+            if bar["close"] > 0:
+                bars = [b for b in bars if b["date"] != bar["date"]]
+                bars.append(bar)
     except Exception:
         pass
-    bars.sort(key=lambda x: x["date"])
-    out = bars[-lmt:]
+    out = daily(bars, source="ths", adjustment="unadjusted")
+    del out[:-lmt]
     if len(out) < 30:
         raise RuntimeError(f"ths kline too short for {code}: {len(out)}")
     return out

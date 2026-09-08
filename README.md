@@ -73,6 +73,7 @@ python3 scanner.py --push        # 扫描并推送
 | `scanner.py` | 扫描引擎：拉数据 → 四条件打分 → 写 JSON / 推 Telegram |
 | `server.py` | 本地看板服务器（纯标准库，默认端口 8808） |
 | `dashboard.html` | 看板页（TradeGenuis 深色主题，自托管字体） |
+| `docker/` | 服务器部署（Dockerfile / compose / 部署说明） |
 | `data/pool.json` | 自选池（`code` 必填） |
 | `data/sectors.json` | 用户自定义关注板块 |
 | `data/*.json` | 扫描结果与缓存（自动生成，已在 .gitignore） |
@@ -102,11 +103,11 @@ python3 scanner.py --push        # 扫描并推送
 **共振分级**（`resonance.py`）：
 
 - **强共振 strong**：1d 已突破（距箱顶 ≤8%，超过算趋势延续）且 1h、30m 均 BREAK/NEAR → 达标推送，不看评分
-- **准共振 soft**：1d BREAK/NEAR 且 30m 或 1h 点火 → 评分 ≥70 才达标
+- **准共振 soft**：1d BREAK/NEAR 且 30m 或 1h 点火 → 需**量价确认**才达标（倍量≥3日×1.8 或 试盘≥3次；热点/资金/控盘等滞后或轮动性代理只进排序分，不再 gate 信号。ETF 仍用纯量价总分 ≥70）
 - **临界池 near**：1d 临界但小周期未点火 → 只在看板展示，次日跟踪
 - ETF 走纯量价口径：共振分（强50/准30/临界15）+ 倍量25 + 试盘25
 
-数据口径：30m/1h 用腾讯 30 分钟K聚合（8 交易时段槽，未收盘K剔除，缺口/重复/异常当日作废）；**1d 用前复权日K直评**（mkline 历史深度有截断，聚合日线凑不满箱体窗口）。扫描对活跃池全体评估（换手≥2% 或涨幅≥2% 或量比≥1.2，自选池保送）。
+数据口径：30m/1h 用 30 分钟K聚合（8 交易时段槽，未收盘K剔除，缺口/重复/异常当日作废），分钟源三重兜底 **腾讯 mkline → 新浪 getKLineData → 东财 push2his**（源间 1.5s 退避；新浪/东财时间戳同为结束时刻，与聚合槽位对齐）；**1d 用前复权日K直评**（mkline 历史深度有截断，聚合日线凑不满箱体窗口）。**除权防御**：30m/1h 为未复权序列，观察窗（近 20 交易日）内复权因子漂移 >0.3% 时分钟箱体已被跳空污染，该股拒绝共振确认、标记数据不可用。扫描对全市场全体评估（`--market` 无粗筛；`--quick` 走活跃池 TOP N 粗筛）。
 
 扫描 JSON 关键字段：`resonance_level`（strong/soft/near/none）、`res_states`（各周期状态）、`timeframes[p].dist_pct`（距箱顶%）。`GET /api/kline?code=&market=stock&interval=30m|1h|1d` 返回扫描快照。
 
@@ -114,21 +115,40 @@ python3 scanner.py --push        # 扫描并推送
 
 ## Docker 部署（服务器）
 
+Docker 相关内容（Dockerfile / compose / ignore 规则 / 部署细节）集中在 `docker/`，详见 [docker/README.md](docker/README.md)。常用命令：
+
 ```bash
 # 0. 确保数据目录存在（git clone 出来的仓库里没有它，缺了会导致扫描结果落盘失败）
 mkdir -p data
-# 1. 改密码：编辑 docker-compose.yml 里的 DASHBOARD_PASSWORD
-# 2. 构建并启动
-docker compose up -d --build
+# 1. 改密码：编辑 docker/docker-compose.yml 里的 DASHBOARD_PASSWORD
+# 2. 构建并启动（在仓库根执行）
+docker compose -f docker/docker-compose.yml up -d --build
 # 3. 查看日志
-docker compose logs -f
+docker compose -f docker/docker-compose.yml logs -f
 ```
 
-- 访问 `http://服务器IP:12300`（端口改 compose 里的 `ports` 映射，左边对外/右边 8808 是容器内固定端口），先输密码登录
+- 访问 `http://服务器IP:12300`（端口改 `docker/docker-compose.yml` 里的 `ports` 映射，左边对外/右边 8808 是容器内固定端口），先输密码登录
 - 基础镜像走华为云镜像站（swr.cn-north-4）、pip 走清华源（已写死在 Dockerfile，国内服务器直接 build）
-- `./data` 挂载到容器内持久化：扫描结果、自选池、universe/ETF/概念缓存、配置
+- 构建上下文是仓库根；数据卷挂到仓库根 `data/`（compose 里 `../data`）持久化：扫描结果、自选池、universe/ETF/概念缓存、配置
 - 不设置 `DASHBOARD_PASSWORD` 时服务只允许本机访问（容器场景等于全部拒绝），公网部署必设
-- 建议由 Nginx/Caddy 反代加 HTTPS 后再暴露公网；compose 里可把端口绑定改为 `127.0.0.1:8808:8808`
+- 建议由 Nginx/Caddy 反代加 HTTPS 后再暴露公网；compose 里可把端口绑定改为 `127.0.0.1:12300:8808`
 - Telegram 推送：在 compose 的 environment 里补 `TG_BOT_TOKEN` / `TG_CHAT_ID`
 
 **服务器限流须知**：行情源全部为公开接口。云服务器 IP 属机房段，东财 clist（股票/ETF 清单）风控比家用宽带严；看板行情刷新已改为腾讯批量接口（一次 50 只），常驻压力很小。若清单接口被限流，扫描自动降级（缓存兜底、当日列表为空），次日自动恢复。必要时把 `MARKET_WORKERS` 降到 4 进一步减少压力。
+
+
+## 2026-09-08 正确性修复
+
+- A股/ETF评分及1d共振只使用扫描截止时刻已经收盘的日K。盘中当天日K不作为已确认突破。旧版快照会提示重新扫描；重启服务后需执行一次新扫描。
+- `timeframes[p]` 新增 `source`、`adjustment`、`closed`；`resonance_version=2`。日K校验日期唯一、OHLC及成交量合法，并与分钟数据的最新完整交易日核对。
+- 腾讯前复权日K为确认信号的日线口径；新浪/同花顺不复权日K仅可降级用于展示/质量计算，不能替代前复权信号，相关标的标记数据不可用。分钟行情三源兜底（腾讯→新浪→东财，`timeframes[p].source` 标注实际来源）；观察窗内复权因子漂移（疑似除权）同样标记数据不可用。
+- 失败突破不再屏蔽后续有效二次突破；箱体窗口标签跟随实际使用的边界。共振分级阈值保持原样，strong仍允许两个小周期处于NEAR，并非三个周期都突破。
+- universe仅复用证券清单，每次扫描批量更新报价；失败的报价字段为空，不沿用旧价格。ETF动态清单缓存缩短至60秒。股东户数按获取时刻每日检查更新，空概念不缓存30天。
+- 腾讯报价网络/解析异常均进入同花顺兜底；东财冷却期间跳过对应主机；资金流主源冷却后可恢复；同花顺当日条覆盖同日期历史条。
+- 后端强/准/临界排序修正，前端只刷新可见卡片，列表可加载更多。落盘 `data_health` 汇总全部计算行的数据健康状态，不能再以裁剪后行数推断失败率。
+- 配置Telegram后，服务端扫描结束调用通知。A股/ETF只推送新达标/变化/明确失效，状态保存在 `data/telegram_state.json`；未变化不重复发送，数据失败不当作信号失效。临界池不推送。消息分别列出三个周期的箱顶和确认时间，超长消息分片。测试仅使用模拟发送。
+- 聚宽版取消会漏选的滚动最高价剪枝；纯计算函数与线上逐字对账测试，小时K由同一30m序列聚合。其交易统计使用实际成交且仅在完整平仓后计数；自定义单笔收益为成交价毛收益，净收益以平台含成本报告为准。ST过滤、持仓与交易执行仍是该回测的额外规则，不等于整个看板策略已验证。
+
+验证：`python -m unittest discover -s tests -v`；浏览器回归需 `npm install --no-save playwright` 后 `node tests/test_dashboard.cjs`（使用系统Edge）。测试拦截所有行情/Telegram请求，不产生真实推送。
+
+聚宽接口参考：[官方数据API说明](https://www.joinquant.com/help/api/doc?id=9875&name=JQDatadoc)。本地测试不替代聚宽平台回测。

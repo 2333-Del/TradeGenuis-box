@@ -11,6 +11,7 @@ from unittest.mock import patch
 from contextlib import ExitStack
 
 import resonance as rs
+import market_data as md
 import scanner as sc
 import server
 
@@ -50,7 +51,7 @@ class RuleTests(unittest.TestCase):
         self.assertFalse(rs.evaluate(candles([99, 99, 100.5]))['ok'])
 
     def test_return_to_top_invalidates(self):
-        result = rs.evaluate(candles([101, 100, 103]))
+        result = rs.evaluate(candles([101, 100, 101]))
         self.assertFalse(result['ok'])
         self.assertEqual(result['reason'], '突破后跌回箱顶')
 
@@ -130,19 +131,22 @@ class IntegrationTests(unittest.TestCase):
         return {p: (dict(base, state=states[p]) if states else dict(base)) for p in rs.PERIODS}
 
     def test_resonance_grading(self):
-        # 强共振不再被评分一票否决；准共振需评分≥70；临界池只跟踪不达标
+        # 强共振不受评分约束；准共振需量价确认（纯K线口径，弱代理评分不再 gate）；临界池只跟踪不达标
         frames = self.frames()   # 三周期 BREAK
         for score in (50, 84, 100):
             row = rs.qualify(dict(score=score, timeframes=frames, resonance_status='已评估'))
             self.assertTrue(row['qualified'], score)
             self.assertEqual(row['mode'], '强共振达标')
         frames = self.frames(states={'30m': 'BREAK', '1h': 'INSIDE', '1d': 'NEAR'})
-        row = rs.qualify(dict(score=75, timeframes=frames, resonance_status='已评估'))
+        row = rs.qualify(dict(score=75, volume_days=3, volume_ratio=2, tests=2,
+                              timeframes=frames, resonance_status='已评估'))
         self.assertEqual(row['resonance_level'], 'soft')
         self.assertTrue(row['qualified'])
-        row = rs.qualify(dict(score=50, timeframes=frames, resonance_status='已评估'))
-        self.assertFalse(row['qualified'])
-        self.assertEqual(row['mode'], '准共振·评分不足')
+        row = rs.qualify(dict(score=50, tests=3, timeframes=frames, resonance_status='已评估'))
+        self.assertTrue(row['qualified'])          # 试盘≥3次单独完成量价确认
+        row = rs.qualify(dict(score=95, timeframes=frames, resonance_status='已评估'))
+        self.assertFalse(row['qualified'])         # 热点/资金等代理高分不再放行准共振
+        self.assertEqual(row['mode'], '准共振·量价未确认')
         frames = self.frames(states={'30m': 'INSIDE', '1h': 'INSIDE', '1d': 'NEAR'})
         row = rs.qualify(dict(score=90, timeframes=frames, resonance_status='已评估'))
         self.assertEqual(row['resonance_level'], 'near')
@@ -150,10 +154,11 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(row['mode'], '临界跟踪')
 
     def test_stale_breakout_downgrades_from_strong(self):
-        # 三周期 BREAK 但 1d 距箱顶 15%（突破已久）→ 趋势延续，降为准共振
+        # 三周期 BREAK 但 1d 距箱顶 15%（突破已久）→ 趋势延续，降为准共振（量价确认在身）
         frames = self.frames()
         frames['1d']['dist_pct'] = 15.0
-        row = rs.qualify(dict(score=80, timeframes=frames, resonance_status='已评估'))
+        row = rs.qualify(dict(score=80, volume_days=3, volume_ratio=2, tests=2,
+                              timeframes=frames, resonance_status='已评估'))
         self.assertEqual(row['resonance_level'], 'soft')
         self.assertTrue(row['qualified'])
 
@@ -168,6 +173,15 @@ class IntegrationTests(unittest.TestCase):
         row = rs.qualify(dict(market='etf', base_score=50, score=50, timeframes=frames,
                               resonance_status='已评估'))
         self.assertEqual(row['score'], 50)      # none 不加分
+        # ETF 准共振维持纯量价总分门槛（40 + 30 = 70 达标，39 + 30 = 69 不达标）
+        frames = self.frames(states={'30m': 'BREAK', '1h': 'INSIDE', '1d': 'NEAR'})
+        row = rs.qualify(dict(market='etf', base_score=40, score=40, timeframes=frames,
+                              resonance_status='已评估'))
+        self.assertEqual(row['score'], 70)
+        self.assertTrue(row['qualified'])
+        row = rs.qualify(dict(market='etf', base_score=39, score=39, timeframes=frames,
+                              resonance_status='已评估'))
+        self.assertFalse(row['qualified'])
 
     def test_old_result_and_crypto_unchanged(self):
         old = rs.qualify(dict(score=100, qualified=True))
@@ -200,9 +214,41 @@ class IntegrationTests(unittest.TestCase):
                 self.assertIn('error',server.get_kline('600519',interval='4h'))
 
     def test_fetch_retries_are_bounded(self):
-        with patch.object(sc,'http_json',side_effect=RuntimeError('offline')) as fetch:
-            with self.assertRaises(RuntimeError): sc.fetch_stock_timeframes('600519',NOW)
-            self.assertEqual(fetch.call_count,2)
+        # 腾讯/新浪走 http_json，东财走 em.minute_kline_raw；三源全部失败即终止
+        with patch.object(sc, 'http_json', side_effect=RuntimeError('offline')) as fetch, \
+             patch.object(sc.em, 'minute_kline_raw', side_effect=RuntimeError('offline')) as em_fetch, \
+             patch.object(sc, 'M30_BACKOFF', 0):
+            with self.assertRaises(RuntimeError):
+                sc.fetch_stock_timeframes('600519', NOW)
+            self.assertEqual(fetch.call_count, 2)
+            self.assertEqual(em_fetch.call_count, 1)
+
+    def test_sina_minute_fallback_takes_over(self):
+        # 腾讯主源失败 → 新浪接管：K线口径一致，确认成功且来源标记 sina_m30。
+        # 新浪源没有独立行情时间戳，新鲜度取自最后一根K → 数据必须截止到 NOW。
+        sessions = []
+        day = NOW
+        while len(sessions) < 65:
+            if day.weekday() < 5:
+                sessions.append(day.strftime('%Y-%m-%d'))
+            day -= timedelta(days=1)
+        sessions.reverse()
+        sina, daily = [], []
+        for date in sessions:
+            for slot in rs.SLOTS:
+                sina.append(dict(day=f"{date} {slot}:00", open=99.0, high=100.0,
+                                 low=90.0, close=99.0, volume=1000.0))
+            daily.append(dict(date=date, open=99, close=99, high=100, low=90, vol=100))
+        bars = md.Bars(daily, source='tencent', adjustment='qfq')
+        with patch.object(sc, 'http_json', side_effect=[RuntimeError('tencent down'), sina]) as fetch, \
+             patch.object(sc, 'M30_BACKOFF', 0):
+            frames = sc.fetch_stock_timeframes('600519', NOW, bars)
+        self.assertEqual(len(frames['30m']['bars']), 65 * 8)
+        self.assertEqual(frames['30m']['source'], 'sina_m30')
+        self.assertEqual(frames['1d']['adjustment'], 'qfq')
+        self.assertEqual(len(fetch.call_args_list), 2)
+        self.assertIn('mkline', fetch.call_args_list[0].args[0])
+        self.assertIn('getKLineData', fetch.call_args_list[1].args[0])
 
     def test_scan_entrypoints_share_cutoff(self):
         stock = dict(code='600519', name='test', theme='', vr=2, turnover=1)
@@ -228,9 +274,12 @@ class IntegrationTests(unittest.TestCase):
 
     def test_stock_analysis_reaches_gate(self):
         quote = dict(price=101,chg=1,turnover=1,volume_ratio=2,name='test')
+        bars = candles([101, 102, 103])
+        for i, bar in enumerate(bars):
+            bar['date'] = (NOW - timedelta(days=len(bars) - 1 - i)).strftime('%Y-%m-%d')
         with ExitStack() as stack:
             stack.enter_context(patch.object(sc,'fetch_quote',return_value=quote))
-            stack.enter_context(patch.object(sc,'fetch_kline',return_value=candles([101,102,103])))
+            stack.enter_context(patch.object(sc,'fetch_kline',return_value=bars))
             stack.enter_context(patch.object(sc,'fetch_fund_flow',return_value=[]))
             for name in ('fetch_holder','_cached_holder'):
                 stack.enter_context(patch.object(sc,name,return_value=None))
@@ -246,7 +295,9 @@ class IntegrationTests(unittest.TestCase):
         raw = [[NOW.strftime('%Y%m%d') + t.replace(':',''),99,99,100,90,10] for t in rs.SLOTS[:6]]
         quote = [''] * 31; quote[30] = '20260907140100'
         payload = dict(data={'sh600519':dict(m30=raw,qt={'sh600519':quote})})
-        with patch.object(sc,'http_json',return_value=payload):
+        with patch.object(sc,'http_json',return_value=payload), \
+             patch.object(sc.em,'minute_kline_raw',side_effect=RuntimeError('offline')), \
+             patch.object(sc,'M30_BACKOFF',0):
             with self.assertRaisesRegex(RuntimeError,'分钟行情不可用'):
                 sc.fetch_stock_timeframes('600519',NOW)
 

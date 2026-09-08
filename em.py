@@ -55,13 +55,12 @@ _cooldown: dict[str, float] = {}   # host -> 禁用截止时间
 
 
 def _pick(hosts: list[str]) -> list[str]:
-    """可用主机按冷却状态排序：健康的随机打乱在前，冷却中的垫底。"""
+    """仅返回已结束冷却的主机；全部冷却时由调用方降级。"""
     now = time.time()
     with _lock:
         healthy = [h for h in hosts if _cooldown.get(h, 0) < now]
-        cooling = [h for h in hosts if _cooldown.get(h, 0) >= now]
     random.shuffle(healthy)
-    return healthy + cooling
+    return healthy
 
 
 def _ban(host: str, seconds: float = 120.0) -> None:
@@ -122,6 +121,16 @@ def clist_raw(params: dict) -> dict:
     base = {"pn": 1, "pz": 80, "po": 1, "np": 1, "fltt": 2, "invt": 2, "ut": EM_UT}
     base.update(params)
     return get_json(PUSH2, "/api/qt/clist/get", base)
+
+
+def minute_kline_raw(code: str, market: int, klt: int = 30, lmt: int = 640) -> dict:
+    """分钟K（不复权，klt=30 → 30分钟线）。klines 行: 'yyyy-MM-dd HH:mm,o,c,h,l,v(手)'，
+    时间戳为结束时刻（与腾讯 mkline 口径一致）。注意：该路径在部分网络环境会被
+    路径级重置（见模块头注），仅作分钟行情的末位兜底，失败由调用方放弃。"""
+    return get_json(PUSH2HIS, "/api/qt/stock/kline/get", {
+        "secid": f"{market}.{code}", "klt": klt, "fqt": 0, "lmt": lmt, "end": 20500101,
+        "fields1": "f1,f2,f3", "fields2": "f51,f52,f53,f54,f55,f56", "ut": EM_UT,
+    })
 
 
 def datacenter_raw(report: str, filter_: str, columns: str = "ALL",

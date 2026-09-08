@@ -157,6 +157,8 @@ def scan_worker(mode: str = "pool", top: int = sc.MARKET_TOP) -> None:
             rows = sc.run_scan(network=True, progress=lambda m: log(m))
         log(f"扫描完成：{len(rows)} 只，达标 {sum(1 for r in rows if r.get('qualified'))} 只")
         STATE["last_scan"] = sc.now_str()
+        if not sc.push_scan(rows, "market" if mode in ("market", "quick") else mode):
+            log("扫描完成，但 Telegram 推送失败；下次扫描重试")
     except Exception as e:
         log(f"扫描失败: {e}")
     finally:
@@ -259,6 +261,7 @@ def get_kline(code: str, lmt: int = 160, market: str = "stock", interval: str = 
     if market == "stock":
         rows = read_json(WATCH_FILE, {}).get("candidates", [])
         row = next((r for r in rows if r.get("code") == code), {})
+        row = sc.rs.qualify(row)
         frame = row.get("timeframes", {}).get(interval)
         if not frame:
             return {"code": code, "error": row.get("resonance_status", "待重新扫描")}

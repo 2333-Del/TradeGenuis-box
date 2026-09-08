@@ -8,7 +8,9 @@
     strong 强共振 = 1d BREAK 且 1h∈{BREAK,NEAR} 且 30m∈{BREAK,NEAR}
     soft   准共振 = 1d∈{BREAK,NEAR} 且 (30m BREAK 或 1h BREAK)   —— 日线临界+小周期点火
     near   临界池 = 1d∈{BREAK,NEAR}（小周期尚未点火，次日跟踪）
-  达标（推送）= 强共振，或 准共振且评分 ≥ RESONANCE_SOFT_SCORE。
+  达标（推送）= 强共振，或 准共振且量价确认 —— 股票用纯K线口径（倍量≥3日×1.8 或 试盘≥3次），
+  热点/资金/控盘等滞后或轮动性代理只影响排序分、不再 gate 信号；ETF 本就是纯量价总分，
+  维持 ≥ RESONANCE_SOFT_SCORE。
 """
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -25,7 +27,10 @@ BUFFER = 0.005
 NEAR_DIST = -3.0         # 距箱顶 ≥ -3% 视为临界
 NEAR_POS = 85.0          # 箱内位置 ≥ 85% 视为临界
 STAND = 1.002            # 现价高于箱顶 0.2% 且近3根低点不破箱顶 → 站稳
-RESONANCE_SOFT_SCORE = 70   # 准共振推送的评分下限（强共振不受评分约束）
+RESONANCE_SOFT_SCORE = 70   # 准共振推送的量价总分下限（ETF 专用；股票走 SOFT_* 量价确认）
+SOFT_VOL_DAYS = 3           # 准共振量价确认：倍量连续天数（与 scanner.VOL_DAYS_REQ 对齐）
+SOFT_VOL_MULT = 1.8         # 准共振量价确认：倍量比率（与 scanner.VOL_MULT 对齐）
+SOFT_TESTS = 3              # 准共振量价确认：箱体试盘次数（与 scanner 试盘满分档对齐）
 STRONG_MAX_DIST = 8.0       # 强共振新鲜度：1d 突破后距箱顶 >8% 视为趋势延续，降为准共振
 ETF_RES_PTS = {"strong": 50, "soft": 30, "near": 15, "none": 0}
 LIMIT = 640
@@ -111,11 +116,14 @@ def evaluate(bars, recent=DEFAULT_RECENT):
                 wlow = min(b["low"] for b in bars[i - LOOKBACK:i])
                 result.update(state="BREAK", ok=True, reason="已确认突破",
                               box_high=whigh, box_low=wlow,
+                              window_start=bars[i - LOOKBACK]["date"],
+                              window_end=bars[i - 1]["date"],
                               dist_pct=round((px / whigh - 1) * 100, 2),
                               pos=round((px - wlow) / (whigh - wlow) * 100, 1))
                 return result
             reason = "突破后跌回箱顶"
-            break
+            result["failed_breakout_at"] = result.pop("breakout_at", None)
+            result["breakout_at"] = None
     # 突破已久但一直站稳箱顶（首次上穿已滑出 recent 窗口的强势股）；
     # 比较窗口必须排除近3根自身，否则箱顶被突破K抬高、判定恒失效
     stand_win = bars[n - 3 - LOOKBACK:n - 3]
@@ -125,6 +133,7 @@ def evaluate(bars, recent=DEFAULT_RECENT):
                 and all(b["low"] >= shigh for b in bars[-3:])):
             result.update(state="BREAK", ok=True, reason="站稳箱顶",
                           box_high=shigh, box_low=slow,
+                          window_start=stand_win[0]["date"], window_end=stand_win[-1]["date"],
                           dist_pct=round((px / shigh - 1) * 100, 2),
                           pos=round((px - slow) / (shigh - slow) * 100, 1))
             return result
@@ -159,11 +168,24 @@ def _level(periods):
     return "none"
 
 
+def _soft_confirmed(row):
+    """准共振推送的量价确认：只认可及时复核的K线口径（倍量/试盘）。
+    热点题材当日轮动、股东户数季度滞后，这类代理只进排序分，不 gate 信号。"""
+    if row.get("market") == "etf":
+        return (row.get("score") or 0) >= RESONANCE_SOFT_SCORE
+    vd = int(row.get("volume_days") or 0)
+    vr = float(row.get("volume_ratio") or 0)
+    return (vd >= SOFT_VOL_DAYS and vr >= SOFT_VOL_MULT) or int(row.get("tests") or 0) >= SOFT_TESTS
+
+
 def qualify(row):
     """共振分级 + 达标判定；币圈不走此口径。ETF 的共振分在这里合成总分。"""
     row = dict(row)
     if row.get("market") == "crypto":
         return row
+    if row.get("resonance_as_of") and row.get("resonance_version") != 2:
+        row["timeframes"] = {}
+        row["resonance_status"] = "待重新扫描：旧版信号口径"
     periods = row.get("timeframes") or {}
     states = {p: (periods.get(p) or {}).get("state") for p in PERIODS}
     row["res_states"] = states
@@ -177,11 +199,11 @@ def qualify(row):
     score = row.get("score") or 0
     row["base_qualified"] = score >= 85
     row["qualified"] = bool(level in ("strong", "soft")
-                            and (level == "strong" or score >= RESONANCE_SOFT_SCORE))
+                            and (level == "strong" or _soft_confirmed(row)))
     if row["qualified"]:
         row["mode"] = "强共振达标" if level == "strong" else "准共振达标"
     elif level == "soft":
-        row["mode"] = "准共振·评分不足"
+        row["mode"] = "准共振·量价未确认"
     elif level == "near":
         row["mode"] = "临界跟踪"
     elif "resonance_status" not in row:

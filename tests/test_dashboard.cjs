@@ -19,14 +19,19 @@ const assert = require('assert');
     page.on('pageerror', e => errors.push(e.message));
     const bars = Array.from({length:63}, (_, i) => ({date:`2026-09-07T${i}:00`, open:99,
       close:i < 60 ? 99 : 101, high:i < 60 ? 100 : 102, low:90, vol:100}));
-    const frame = {ok:true,reason:'已确认突破',box_high:100,box_low:90,
+    const frame = {state:'BREAK',ok:true,reason:'已确认突破',box_high:100,box_low:90,
       breakout_at:bars[60].date,confirmed_at:bars[62].date};
     let row = {code:'600519',name:'测试股票',qualified:true,score:100,price:101,chg:1,
-      resonance_status:'已评估',timeframes:Object.fromEntries(['30m','1h','1d'].map(p=>[p,frame]))};
+      resonance_level:'strong',resonance_status:'已评估',timeframes:Object.fromEntries(['30m','1h','1d'].map(p=>[p,frame]))};
+    let extra = []; const quoteRequests = [];
     await page.route('**/api/**', async route => {
       const u = new URL(route.request().url());
       let data = {};
-      if (u.pathname === '/api/watchlist') data = {candidates:[row]};
+      if (u.pathname === '/api/watchlist') data = {candidates:[...extra,row]};
+      if (u.pathname === '/api/quotes') {
+        const codes = u.searchParams.get('codes').split(','); quoteRequests.push(codes);
+        data = Object.fromEntries(codes.map(code => [code, {price:102,chg:2}]));
+      }
       if (u.pathname === '/api/crypto') data = {candidates:[]};
       if (u.pathname === '/api/hot') data = {hot_topics:[]};
       if (u.pathname === '/api/status') data = {scanning:false,scan_log:[]};
@@ -38,7 +43,9 @@ const assert = require('assert');
     });
     const url = `http://127.0.0.1:${app.address().port}`;
     await page.goto(url); await page.waitForLoadState('networkidle');
-    assert((await page.locator('.resonance').innerText()).includes('共振 3/3'));
+    assert((await page.locator('.resonance').innerText()).includes('共振 强'));
+    await page.waitForFunction(()=>document.querySelector('[data-px]').textContent === '102.00');
+    await page.waitForFunction(()=>document.querySelector('[data-chg]').textContent.includes('2.00'));
     await Promise.all([
       page.waitForResponse(r => r.url().includes('interval=30m')),
       page.getByLabel('K线周期').selectOption('30m')
@@ -51,6 +58,17 @@ const assert = require('assert');
     await page.waitForLoadState('networkidle');
     assert(requests.includes('30m') && requests.includes('1h') && requests.includes('1d'), JSON.stringify({requests,errors}));
     assert((await page.locator('[data-confirm]').innerText()).includes('突破：'));
+    extra = Array.from({length:125}, (_, i) => ({...row, code:String(600100+i), score:50,
+      qualified:false,resonance_level:'near'}));
+    quoteRequests.length = 0;
+    await page.reload(); await page.waitForLoadState('networkidle');
+    assert.equal(await page.locator('.sig').count(),60);
+    assert(quoteRequests.some(codes => codes.includes('600519')), 'visible strong stock must refresh despite raw ordering');
+    await page.getByRole('button',{name:'加载更多'}).click();
+    assert.equal(await page.locator('.sig').count(),120);
+    await page.getByRole('button',{name:'加载更多'}).click();
+    assert.equal(await page.locator('.sig').count(),126);
+    extra = [];
     row = {...row,qualified:false,resonance_status:'数据不可用'};
     await page.reload(); await page.waitForLoadState('networkidle');
     assert((await page.locator('.empty').innerText()).includes('行情获取失败'));
@@ -60,7 +78,7 @@ const assert = require('assert');
     await page.getByRole('button',{name:'加密货币',exact:true}).click();
     assert(await page.locator('.empty').isVisible());
     assert.deepEqual(errors,[]);
-    console.log('PASS dashboard: period switching, confirmations, errors, legacy data, crypto tab');
+    console.log('PASS dashboard: period switching, confirmations, visible quotes, pagination, errors, legacy data, crypto tab');
   } finally {
     if (browser) await browser.close();
     await new Promise(resolve => app.close(resolve));
