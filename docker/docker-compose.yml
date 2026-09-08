@@ -1,9 +1,10 @@
 services:
   dashboard:
-    # 构建：上下文为仓库根（Dockerfile 的 COPY 源码相对根目录），Dockerfile 在 docker/ 下
+    # 构建：上下文为仓库根（Dockerfile 的 COPY 源码相对根目录）；
+    # 注意 dockerfile 字段相对「上下文」解析（不是相对本文件），所以是 docker/Dockerfile
     build:
       context: ..
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile
     container_name: tradegenuis
     restart: unless-stopped
     ports:
