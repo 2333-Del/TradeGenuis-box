@@ -8,3 +8,4 @@ tests/
 docs/
 start.sh
 *.md
+docker/.env

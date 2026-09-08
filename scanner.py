@@ -1083,9 +1083,9 @@ def screen_universe(stocks: list[dict], top: int | None = None,
     cands.sort(key=lambda s: (s.get("vr", 0), s["chg"], s["turnover"]), reverse=True)
     picked = cands if not top else cands[:top]
     have = {s["code"] for s in picked}
-    for s in stocks:                     # 自选池保送
-        if s["code"] in pool_codes and s["code"] not in have and (s.get("price") or 0) > 0:
-            picked.append(s)
+    for s in stocks:                     # 自选池保送：不看行情字段——腾讯批量行情整体失败时
+        if s["code"] in pool_codes and s["code"] not in have:  # price=None，保送语义仍须成立；
+            picked.append(s)             # 深算对 None 已容忍（展示由 3s 行情刷新补真值）
             have.add(s["code"])
     return picked
 

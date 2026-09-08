@@ -151,6 +151,24 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(sc._cached_concepts('600519'), [])
             self.assertEqual(sc._cached_concepts('600519'), ['科技'])
 
+    def test_pool_bypass_and_deep_calc_survive_quote_outage(self):
+        # P1回归：腾讯批量行情失败置 price/chg=None 时，自选池保送不被击穿，
+        # 且缺行情字段的股票能走完深算（不因 None 字段抛错丢行）
+        stock = dict(code='600519', name='pool', price=None, chg=None, turnover=0.0, vr=0.0,
+                     quote_source='unavailable')
+        active = dict(code='000001', name='act', price=10.0, chg=5.0, turnover=1.0, vr=2.0)
+        picked = sc.screen_universe([stock, active], top=1, pool_codes={'600519'})
+        self.assertTrue(any(s['code'] == '600519' for s in picked))
+        with patch.object(sc, 'fetch_kline', return_value=days()), \
+             patch.object(sc, 'fetch_fund_flow', return_value=[]), \
+             patch.object(sc, '_cached_holder', return_value=None), \
+             patch.object(sc, '_cached_concepts', return_value=[]), \
+             patch.object(sc, 'fetch_stock_timeframes', side_effect=RuntimeError('offline')):
+            row = sc.analyze_market(stock, set(), NOW)
+        self.assertIsNotNone(row)
+        self.assertIsNone(row['price'])
+        self.assertEqual(row['resonance_status'], '数据不可用')
+
 
 class ResponseTests(unittest.TestCase):
     """看板响应瘦身：列表剥K线数组、大JSON按Accept-Encoding gzip。"""
