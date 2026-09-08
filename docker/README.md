@@ -6,9 +6,24 @@ Docker 相关内容都收在本目录：
 docker/
 ├── Dockerfile              # 镜像：华为云 python:3.12.9-slim + 清华 pip 源
 ├── Dockerfile.dockerignore # 构建上下文排除规则（相对仓库根；需 Docker BuildKit，Compose v2 默认开启）
-├── docker-compose.yml      # 编排：端口/密码/数据卷
+├── docker-compose.yml      # 编排：端口/密码/数据卷（环境变量从本目录 .env 插值）
+├── .env.example            # 配置模板：复制为 .env 填真实值
 └── README.md
 ```
+
+## 配置（docker/.env）
+
+密码、Telegram 都从 `docker/.env` 进来，不进 git：
+
+```bash
+cp docker/.env.example docker/.env
+vi docker/.env     # 填 DASHBOARD_PASSWORD（必改）；TG_BOT_TOKEN / TG_CHAT_ID 可选
+```
+
+- Compose 启动时自动读取 compose 文件同目录的 `.env`（`-f docker/docker-compose.yml` 和 `cd docker` 两种方式都会命中）；
+- 改完 `.env` 需 `up -d` 重建容器才生效；
+- 临时覆盖：启动前 `export DASHBOARD_PASSWORD=xxx`（shell 变量优先级高于 `.env`）；
+- **不设密码 = 服务只允许本机访问，容器内等于全部拒绝**，公网部署必设。
 
 ## 上线步骤
 
@@ -16,8 +31,8 @@ docker/
 # 0. 服务器上拿到完整代码（git clone 或 rsync；确保 market_data.py / notifications.py 等新文件都在）
 git clone <repo-url> && cd TradeGenuis-box
 
-# 1. 改密码：编辑 docker/docker-compose.yml 里的 DASHBOARD_PASSWORD
-#    （不设密码 = 服务只允许本机访问，容器内等于全部拒绝）
+# 1. 配置：复制模板并填密码/Telegram
+cp docker/.env.example docker/.env && vi docker/.env
 
 # 2. 构建并启动（在仓库根执行；首次拉镜像+构建约 1-3 分钟）
 docker compose -f docker/docker-compose.yml up -d --build

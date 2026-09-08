@@ -120,7 +120,8 @@ Docker 相关内容（Dockerfile / compose / ignore 规则 / 部署细节）集�
 ```bash
 # 0. 确保数据目录存在（git clone 出来的仓库里没有它，缺了会导致扫描结果落盘失败）
 mkdir -p data
-# 1. 改密码：编辑 docker/docker-compose.yml 里的 DASHBOARD_PASSWORD
+# 1. 配置：复制模板并填密码 / Telegram（docker/.env 已 gitignore，不会提交）
+cp docker/.env.example docker/.env && vi docker/.env
 # 2. 构建并启动（在仓库根执行）
 docker compose -f docker/docker-compose.yml up -d --build
 # 3. 查看日志

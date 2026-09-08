@@ -45,7 +45,7 @@ python3 scanner.py --push       # 扫描并推送
 ## Docker 部署（服务器）
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d --build    # 先改 docker/docker-compose.yml 里的 DASHBOARD_PASSWORD
+docker compose -f docker/docker-compose.yml up -d --build    # 配置在 docker/.env（模板 docker/.env.example，已 gitignore）
 ```
 
 Docker 内容集中在 `docker/`（Dockerfile、compose、Dockerfile.dockerignore、部署README）。构建上下文是仓库根（COPY 路径相对根）；数据卷挂仓库根 `data/`。

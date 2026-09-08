@@ -11,10 +11,13 @@ services:
       # 对公网开放前建议改为 "127.0.0.1:12300:8808"，由 Nginx/Caddy 反代加 HTTPS
       - "12300:8808"
     environment:
-      # 必改：外网访问密码。不设置时服务只允许本机访问（容器内等于全部拒绝）
-      DASHBOARD_PASSWORD: "change-me-please"
-      # Telegram 推送（可选）
-      # TG_BOT_TOKEN: ""
-      # TG_CHAT_ID: ""
+      # 所有值从 docker/.env 读取（复制 docker/.env.example 为 docker/.env 后填写）。
+      # compose -f docker/docker-compose.yml 启动时自动加载 compose 文件同目录的 .env；
+      # 也可以不改文件，直接在启动前 export 环境变量（shell 变量优先级高于 .env）。
+      # 不设密码 = 服务只允许本机访问（容器内等于全部拒绝），公网部署必设
+      DASHBOARD_PASSWORD: "${DASHBOARD_PASSWORD:-}"
+      # Telegram 推送（可选，留空则用看板 banner 里保存的配置）
+      TG_BOT_TOKEN: "${TG_BOT_TOKEN:-}"
+      TG_CHAT_ID: "${TG_CHAT_ID:-}"
     volumes:
       - ../data:/app/data   # 扫描结果/缓存/自选池/配置 持久化在仓库根 data/（相对本文件）

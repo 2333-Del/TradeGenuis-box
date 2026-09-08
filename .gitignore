@@ -16,4 +16,7 @@ data/sectors.json
 venv/
 *.log
 
+# Docker 部署密钥（compose 从 docker/.env 读取；模板见 docker/.env.example）
+docker/.env
+
 data/fund_heavy.json
