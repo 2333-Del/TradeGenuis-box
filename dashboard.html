@@ -179,6 +179,8 @@
       <button class="tab on" data-market="stock" type="button">A股</button>
       <button class="tab" data-market="crypto" type="button">加密货币</button>
     </div>
+    <button class="act" id="btnQuick" type="button"
+      title="快扫：活跃池 TOP200（涨幅/换手/量比粗筛，约1-2分钟）。只能看到当日已启动的共振；箱顶缩量蓄势的临界股会被漏掉，收盘前建议再跑一次全市场">快扫 TOP200</button>
     <button class="act go" id="btnScan" type="button">全市场扫描</button>
   </div>
 
@@ -533,10 +535,12 @@ async function refreshQuotes() {
 
 /* =============================== 扫描 / 配置 =============================== */
 let scanning = false;
-async function doScan() {
+async function doScan(mode) {
   if (scanning) return;
-  const mode = S.market === "crypto" ? "crypto" : "market";
-  scanning = true; $("btnScan").disabled = true; $("btnScan").textContent = "扫描中…";
+  mode = mode || (S.market === "crypto" ? "crypto" : "market");
+  scanning = true;
+  $("btnScan").disabled = true; $("btnScan").textContent = "扫描中…";
+  if ($("btnQuick")) { $("btnQuick").disabled = true; $("btnQuick").textContent = "扫描中…"; }
   try {
     const r = await jfetch("api/scan", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode }) });
@@ -554,6 +558,7 @@ async function doScan() {
     toast("扫描失败（若控制台有红色报错请截图反馈）");
   }
   scanning = false; $("btnScan").disabled = false; $("btnScan").textContent = S.market === "crypto" ? "币圈扫描" : "全市场扫描";
+  if ($("btnQuick")) { $("btnQuick").disabled = false; $("btnQuick").textContent = "快扫 TOP200"; }
 }
 
 async function saveCfg() {
@@ -572,6 +577,8 @@ function switchMarket(market) {
   S.kbars = {};
   if (market === "crypto") S.selBoard = null;   // 板块筛选仅 A股
   $("btnScan").textContent = market === "crypto" ? "币圈扫描" : "全市场扫描";
+  const quick = $("btnQuick");                  // 快扫仅 A股
+  if (quick) quick.style.display = market === "crypto" ? "none" : "";
   renderAll();   // 卡片与图表懒加载由 renderCards 统一处理
 }
 
@@ -585,6 +592,8 @@ function boot() {
     t.addEventListener("click", () => switchMarket(t.dataset.market));
   });
   $("btnScan").addEventListener("click", () => doScan());
+  const quick = $("btnQuick");                  // 快扫：活跃池 TOP200 粗筛（仅A股）
+  if (quick) quick.addEventListener("click", () => doScan("quick"));
   // 热门板块点击筛选
   $("hotTopics").addEventListener("click", e => {
     const chip = e.target.closest(".hot-chip[data-board]"); if (!chip) return;

@@ -46,6 +46,15 @@ const assert = require('assert');
     assert((await page.locator('.resonance').innerText()).includes('共振 强'));
     await page.waitForFunction(()=>document.querySelector('[data-px]').textContent === '102.00');
     await page.waitForFunction(()=>document.querySelector('[data-chg]').textContent.includes('2.00'));
+    // 快扫按钮：应发出 mode=quick 的扫描请求（快扫仅 A股）
+    const scanBodies = [];
+    await page.route('**/api/scan', async route => {
+      scanBodies.push(route.request().postDataJSON());
+      await route.fulfill({json: {}});
+    });
+    await page.click('#btnQuick');
+    await page.waitForTimeout(150);
+    assert.deepEqual(scanBodies, [{mode:'quick'}]);
     await Promise.all([
       page.waitForResponse(r => r.url().includes('interval=30m')),
       page.getByLabel('K线周期').selectOption('30m')
@@ -87,6 +96,7 @@ const assert = require('assert');
     assert((await page.locator('.empty').innerText()).includes('待重新扫描'));
     await page.getByRole('button',{name:'加密货币',exact:true}).click();
     assert(await page.locator('.empty').isVisible());
+    assert(!(await page.locator('#btnQuick').isVisible()), '快扫按钮在币圈页应隐藏');
     assert.deepEqual(errors,[]);
     console.log('PASS dashboard: period switching, confirmations, visible quotes, pagination, errors, legacy data, crypto tab');
   } finally {
