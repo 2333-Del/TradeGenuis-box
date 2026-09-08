@@ -28,6 +28,7 @@ TradeGenuis · 箱体突破 本地看板服务器
 from __future__ import annotations
 
 import argparse
+import gzip
 import hmac
 import json
 import os
@@ -196,6 +197,17 @@ def read_json(path: Path, default):
     return default
 
 
+def public_row(row: dict) -> dict:
+    """看板列表响应剥离三周期K线数组（图表由 /api/kline 从同一份快照单独供给）。"""
+    frames = row.get("timeframes")
+    if not frames:
+        return row
+    row = dict(row)
+    row["timeframes"] = {p: {k: v for k, v in (f or {}).items() if k != "bars"}
+                         for p, f in frames.items()}
+    return row
+
+
 def pool_stocks() -> list[dict]:
     return read_json(POOL_FILE, {"stocks": []}).get("stocks", [])
 
@@ -343,6 +355,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code: int, body: bytes, ctype: str = "application/json; charset=utf-8",
               extra_headers: list[tuple[str, str]] | None = None):
+        # 大响应按 Accept-Encoding 就地 gzip（watchlist 级 JSON 可压掉 ~90% 传输量）
+        if len(body) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            packed = gzip.compress(body, 6)
+            if len(packed) < len(body):
+                body = packed
+                extra_headers = [*(extra_headers or []), ("Content-Encoding", "gzip"),
+                                 ("Vary", "Accept-Encoding")]
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -405,7 +424,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "not found"}, 404)
         elif p == "/api/watchlist":
             payload = read_json(WATCH_FILE, {"as_of": None, "candidates": []})
-            payload["candidates"] = [sc.rs.qualify(r) for r in payload.get("candidates", [])]
+            # 列表页只用状态/评分/箱体标量（图表走 /api/kline 按需拉）；
+            # 剥掉 timeframes[].bars，首屏从十几 MB 降到几十 KB
+            payload["candidates"] = [public_row(sc.rs.qualify(r))
+                                     for r in payload.get("candidates", [])]
             self._json(payload)
         elif p == "/api/crypto":
             self._json(read_json(sc.CRYPTO_FILE, {"as_of": None, "candidates": []}))

@@ -2,12 +2,15 @@
 import ast
 import copy
 from datetime import datetime, timedelta
+import gzip
 import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
+from urllib.request import Request, urlopen
 
 import em
 import market_data as md
@@ -147,6 +150,46 @@ class ProviderTests(unittest.TestCase):
         with patch.object(sc, '_mkt_cache', {}), patch.object(sc, 'fetch_concepts', side_effect=[[], ['科技']]), patch.object(sc, '_mkt_cache_save'):
             self.assertEqual(sc._cached_concepts('600519'), [])
             self.assertEqual(sc._cached_concepts('600519'), ['科技'])
+
+
+class ResponseTests(unittest.TestCase):
+    """看板响应瘦身：列表剥K线数组、大JSON按Accept-Encoding gzip。"""
+
+    def watch_file(self, tmp):
+        bars = [dict(date=str(i), open=99, close=99, high=100, low=90, vol=10) for i in range(60)]
+        frames = {p: dict(state='BREAK', box_high=100, breakout_at='x', confirmed_at='y', bars=bars)
+                  for p in rs.PERIODS}
+        row = dict(code='600519', score=100, resonance_as_of='t', resonance_version=2,
+                   resonance_status='已评估', timeframes=frames)
+        file = Path(tmp) / 'watch.json'
+        file.write_text(json.dumps(dict(candidates=[row], padding='x' * 20000)), encoding='utf-8')
+        return file
+
+    def test_watchlist_strips_bars_and_gzips(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(server, 'WATCH_FILE', self.watch_file(tmp)):
+            app = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+            worker = threading.Thread(target=app.serve_forever, daemon=True)
+            worker.start()
+            try:
+                root = f'http://127.0.0.1:{app.server_port}'
+                # 不带 Accept-Encoding：明文返回，candidates 已不含 bars
+                with urlopen(root + '/api/watchlist') as resp:
+                    self.assertIsNone(resp.headers.get('Content-Encoding'))
+                    body = json.loads(resp.read())
+                candidate = body['candidates'][0]
+                self.assertEqual(candidate['code'], '600519')
+                self.assertEqual(candidate['resonance_level'], 'strong')
+                for frame in candidate['timeframes'].values():
+                    self.assertNotIn('bars', frame)
+                    self.assertEqual(frame['state'], 'BREAK')
+                # 带 gzip：响应被压缩且可解压还原
+                req = Request(root + '/api/watchlist', headers={'Accept-Encoding': 'gzip'})
+                with urlopen(req) as resp:
+                    self.assertEqual(resp.headers.get('Content-Encoding'), 'gzip')
+                    restored = gzip.decompress(resp.read())
+                self.assertEqual(json.loads(restored)['candidates'][0]['code'], '600519')
+            finally:
+                app.shutdown(); app.server_close(); worker.join()
 
 
 class RuleParityTests(unittest.TestCase):
