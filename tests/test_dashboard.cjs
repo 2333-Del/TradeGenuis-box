@@ -68,6 +68,16 @@ const assert = require('assert');
     assert.equal(await page.locator('.sig').count(),120);
     await page.getByRole('button',{name:'加载更多'}).click();
     assert.equal(await page.locator('.sig').count(),126);
+    // 共振级别筛选 + 页内重渲染一致性（回归：#poolCount 残留写入曾使第二次 renderAll 抛错，
+    // 表现为横幅与标题数字脱钩、筛选片点击无效）
+    await page.click('.res-chip[data-res="near"]');
+    assert.equal(await page.locator('.sig').count(),60);
+    await page.click('.res-chip[data-res="strong"]');
+    assert.equal(await page.locator('.sig').count(),1);
+    await page.evaluate(() => renderAll());
+    const banner = (await page.locator('#hpHit').innerText()).trim();
+    const title = await page.locator('#cardsTitle').innerText();
+    assert(banner === '1' && title.includes('达标 1'), JSON.stringify({banner,title}));
     extra = [];
     row = {...row,qualified:false,resonance_status:'数据不可用'};
     await page.reload(); await page.waitForLoadState('networkidle');

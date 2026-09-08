@@ -184,7 +184,7 @@
 
   <section class="card">
     <div class="sec-head">
-      <h3 id="cardsTitle">今日达标 <span class="plan-count" id="poolCount"></span></h3>
+      <h3 id="cardsTitle">今日达标</h3>
       <span class="mode-tag" id="hotTopics" style="display:none"></span>
     </div>
     <div class="cards" id="cards"></div>
@@ -252,11 +252,12 @@ function renderAll() {
     ? (scope === "crypto" ? (data.universe_size ?? "—") + " 币" :
        scope === "market" ? (data.universe_size ?? "—") + " 只" : "自选池")
     : "—";
-  $("poolCount").textContent = S.loaded ? hits.length : "";
+  // 注意：不要在这里写 #poolCount —— 标题分支的 innerHTML 会重建/删除该元素，
+  // 首次渲染后它可能不存在，残留写入会让 renderAll 中途抛错（横幅与标题不同步、筛选失效）
   if (scope === "crypto") {
-    $("cardsTitle").innerHTML = `币圈涨幅榜 <span class="plan-count" id="poolCount">${S.loaded ? rows.length : ""}</span> <span class="mode-tag" style="color:var(--up)">达标 ${hits.length}</span>`;
+    $("cardsTitle").innerHTML = `币圈涨幅榜 <span class="plan-count">${S.loaded ? rows.length : ""}</span> <span class="mode-tag" style="color:var(--up)">达标 ${hits.length}</span>`;
   } else if (S.selBoard) {
-    $("cardsTitle").innerHTML = `板块「${S.selBoard}」 <span class="plan-count" id="poolCount" data-board-count>—</span>`;
+    $("cardsTitle").innerHTML = `板块「${S.selBoard}」 <span class="plan-count" data-board-count>—</span>`;
   } else {
     const counts = { strong: 0, soft: 0, near: 0 };
     rows.forEach(r => { if (r.resonance_level in counts) counts[r.resonance_level]++; });
