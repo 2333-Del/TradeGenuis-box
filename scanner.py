@@ -42,6 +42,7 @@ from pathlib import Path
 import requests
 import resonance as rs
 import notifications
+from history_store import archived_scan, scan_cutoff
 from market_data import daily as closed_daily, factor_drift
 
 try:
@@ -831,9 +832,10 @@ def analyze(code: str, name: str, theme_hint: str,
     return apply_resonance(score_row(row), as_of or datetime.now(BJT), daily_bars=bars)
 
 
+@archived_scan('pool')
 def run_scan(network: bool = True, progress=None) -> list[dict]:
     """执行扫描，写 data/watchlist.json，返回候选行。"""
-    as_of = datetime.now(BJT)
+    as_of = scan_cutoff()
     pool = load_pool()
     hot_topics, hot_names = ([], set())
     if network:
@@ -1348,13 +1350,14 @@ def _save_market(rows: list[dict], stocks: list[dict], hot_topics: list[dict],
                           encoding="utf-8")
 
 
+@archived_scan('market')
 def run_market_scan(full: bool = True, top: int = MARKET_TOP,
                     workers: int = MARKET_WORKERS, progress=None) -> list[dict]:
     """
     全市场扫描（共振主筛）：full=True 对当日活跃池全体深度计算（换手/涨幅/量比粗筛），
     full=False（快扫）只取活跃强度 TOP N；A 股之后并入活跃 ETF 池（纯量价共振口径）。
     """
-    as_of = datetime.now(BJT)
+    as_of = scan_cutoff()
     if progress:
         progress("拉取沪深 A 股全量清单（首次较慢，此后按日缓存）…")
     stocks = fetch_universe()

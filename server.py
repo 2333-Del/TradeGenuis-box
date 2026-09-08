@@ -35,11 +35,15 @@ import os
 import secrets
 import threading
 import time
+import traceback
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import scanner as sc
+import history_store
+import reviews
+from urllib.parse import urlsplit, parse_qs
 
 ROOT = Path(__file__).resolve().parent
 WATCH_FILE = ROOT / "data" / "watchlist.json"
@@ -372,7 +376,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, obj, code: int = 200):
-        self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+        self._send(code, json.dumps(obj, ensure_ascii=False,
+            default=lambda value: value.astimezone(sc.BJT).isoformat() if isinstance(value,datetime) else str(value)).encode("utf-8"))
 
     def _body(self) -> dict:
         try:
@@ -391,12 +396,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json({"error": "unauthorized"}, 401)
             return
-        q = {}
-        if "?" in self.path:
-            for kv in self.path.split("?", 1)[1].split("&"):
-                if "=" in kv:
-                    k, v = kv.split("=", 1)
-                    q[k] = v
+        q = {k: v[-1] for k,v in parse_qs(urlsplit(self.path).query).items()}
+        if p.startswith('/api/history/') or p.startswith('/api/reviews/') or p == '/api/review-stats':
+            self._history_get(p,q)
+            return
 
         if p in ("/", "/index.html"):
             try:
@@ -444,6 +447,7 @@ class Handler(BaseHTTPRequestHandler):
                     "scan_log": STATE["scan_log"][-12:],
                     "as_of": (read_json(WATCH_FILE, {}) or {}).get("as_of"),
                     "is_trading_time": sc.is_trading_time(),
+                    "archive": dict(history_store.STATE),
                 })
         elif p == "/api/config":
             with LOCK:
@@ -477,6 +481,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._authenticated():
             self._json({"error": "unauthorized"}, 401)
+            return
+        if p == '/api/reviews':
+            try:
+                self._json(reviews.start(self._body()),202)
+            except reviews.ReviewConflict as exc:
+                self._json({'error':str(exc)},409)
+            except (ValueError,TypeError) as exc:
+                self._json({'error':str(exc)},400)
+            except Exception:
+                log('创建复盘任务失败：' + traceback.format_exc())
+                self._json({'error':'复盘服务不可用，请检查 PostgreSQL','archive':dict(history_store.STATE)},503)
             return
         if p == "/api/logout":
             self._handle_logout()
@@ -527,6 +542,23 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
+    def _history_get(self,p,q):
+        try:
+            parts=p.strip('/').split('/')
+            if p=='/api/history/batches': result=reviews.batches(q)
+            elif p=='/api/review-stats': result=reviews.stats(q)
+            elif len(parts)==3 and parts[1]=='reviews': result=reviews.job_detail(parts[2])
+            elif len(parts)==4 and parts[1:3]==['history','batches']: result=reviews.batch_detail(parts[3],q)
+            elif len(parts)==6 and parts[1:3]==['history','batches'] and parts[4]=='symbols': result=reviews.symbol_detail(parts[3],parts[5])
+            else: raise LookupError('接口不存在')
+            self._json(result)
+        except (ValueError,TypeError) as exc:
+            self._json({'error':str(exc)},400)
+        except LookupError as exc:
+            self._json({'error':str(exc)},404)
+        except Exception:
+            self._json({'error':'历史数据库不可用，请检查 PostgreSQL 配置与连接','archive':dict(history_store.STATE)},503)
+
     def log_message(self, fmt, *args):
         pass
 
@@ -538,6 +570,12 @@ def main() -> int:
     args = ap.parse_args()
 
     load_config()
+    history_store.initialize()
+    def archive_loop():
+        while True:
+            history_store.flush()
+            time.sleep(30)
+    threading.Thread(target=archive_loop,daemon=True).start()
     log(f"访问控制：{'密码登录已启用' if auth_password() else '未设置 DASHBOARD_PASSWORD，仅允许本机访问'}")
     log(f"自动扫描：{'开' if STATE['config'].get('auto') else '关'} · "
         f"{' / '.join(STATE['config'].get('auto_times') or [])} 每个交易日")

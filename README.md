@@ -17,7 +17,8 @@
 - **自动扫描调度**：每个交易日 11:30（午间收盘）/ 15:00（收盘）各扫一次，服务端常驻调度
 - **实时行情刷新**：达标标的每 3 秒静默刷新价格/涨跌
 - **Telegram 推送**（可选）：扫描结果推送至群/私聊
-- **零数据库、零 API Key**：全部依赖公开接口（腾讯/新浪/东方财富/Binance），结果即 JSON 文件
+- **历史与复盘**：PostgreSQL 保存不可变选股快照，按交易日手动更新 1／3／5 日信号表现；实时结果继续使用 JSON。
+- **零行情 API Key**：依赖公开接口（腾讯/新浪/东方财富/Binance）。
 
 ## 快速启动
 
@@ -151,5 +152,23 @@ docker compose -f docker/docker-compose.yml logs -f
 - 聚宽版取消会漏选的滚动最高价剪枝；纯计算函数与线上逐字对账测试，小时K由同一30m序列聚合。其交易统计使用实际成交且仅在完整平仓后计数；自定义单笔收益为成交价毛收益，净收益以平台含成本报告为准。ST过滤、持仓与交易执行仍是该回测的额外规则，不等于整个看板策略已验证。
 
 验证：`python -m unittest discover -s tests -v`；浏览器回归需 `npm install --no-save playwright` 后 `node tests/test_dashboard.cjs`（使用系统Edge）。测试拦截所有行情/Telegram请求，不产生真实推送。
+
+## 选股历史与效果复盘
+
+顶部「选股历史」按日期和扫描批次查看 A股／ETF。当时的报价、各周期箱顶、评分、信号和 K 线不可变；点击「更新本批次表现」或选择日期范围后手动复盘。历史和统计页面不会自动请求行情。
+
+- 默认汇总每天最后一次收盘全量扫描；没有该批次的日期不拿午盘或快扫补位。A股、ETF和策略版本分组，临界池独立筛选。
+- 窗口为选出日期之后第 1／3／5 个市场交易日，使用 `exchange_calendars` 的 XSHG 日历；超出已发布日历范围不推算工作日。
+- 上涨率：目标收盘价相对当时有效报价上涨的比例。突破率：原 NEAR 样本收盘严格高于原箱顶 × 1.005；守住率：原 BREAK 样本收盘高于原箱顶。指标是信号表现，不是交易收益或交易胜率。
+- 停牌／无成交、缺失行情、未到观察期、无法对齐复权尺度分别标注并排除相应分母。跨日重复入选按每日信号样本计数。
+- 公开分钟行情历史有限，久远批次可能无法补足 30m／1h 表现。日线与分钟分开保存，获取不到不会虚构数据。刷新失败保留旧有效指标，并显示旧结果标记和失败原因。
+- 扫描先写 `data/history_outbox`，再事务提交 PostgreSQL；断线时显示待归档，服务每30秒重试。历史唯一批次ID保证重复重试不重复入库。队列所在磁盘也不可写时明确报错。
+- 首次启动将现存 `watchlist.json` 幂等导入为旧数据，默认不进入汇总；不能恢复此前已经被覆盖的扫描。
+
+Docker 使用应用＋PostgreSQL 17，配置、数据卷和备份恢复见 [部署说明](docker/README.md)。本机运行先安装 `requirements.txt`，设置 `DATABASE_URL`，或设置 `PGHOST / PGPORT / PGDATABASE / PGUSER / PGPASSWORD` 后运行 `python server.py`。不配置数据库时实时看板仍可使用，新快照暂存本地队列，历史API明确返回503。不要长期只依赖本地队列。
+
+新增模块：`history_store.py`（连接池／迁移／归档），`reviews.py`（复盘／查询），`migrations/`（版本化DDL），`static/history.js`（历史与统计页面）。历史API与复盘API沿用看板认证。
+
+验证：`python -m unittest discover -s tests -v`；设置 **独立可清空测试库** `HISTORY_TEST_DATABASE_URL` 可运行真实 PostgreSQL 集成测试（会清空该库的历史表）。浏览器测试为 `node tests/test_dashboard.cjs` 和 `node tests/test_history.cjs`，仅使用模拟行情，不发送 Telegram。
 
 聚宽接口参考：[官方数据API说明](https://www.joinquant.com/help/api/doc?id=9875&name=JQDatadoc)。本地测试不替代聚宽平台回测。

@@ -21,3 +21,7 @@ node_modules/
 docker/.env
 
 data/fund_heavy.json
+data/history_outbox/
+data/history_imported
+data/test_pg/
+data/history_test_artifacts/

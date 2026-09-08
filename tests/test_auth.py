@@ -43,7 +43,7 @@ class AuthTests(unittest.TestCase):
         return op.open(req, timeout=5)
 
     def test_unauthenticated_requests_are_blocked(self):
-        for path in ("/api/watchlist", "/api/status", "/api/quotes?codes=600519", "/static/fonts/x.woff2"):
+        for path in ("/api/watchlist", "/api/status", "/api/quotes?codes=600519", "/static/fonts/x.woff2", "/api/history/batches", "/api/review-stats", "/api/reviews/test"):
             with self.subTest(path=path), self.assertRaises(HTTPError) as ctx:
                 self.get(path)
             self.assertEqual(ctx.exception.code, 401)

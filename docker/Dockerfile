@@ -10,6 +10,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY scanner.py server.py resonance.py market_data.py notifications.py em.py ths.py fund.py dashboard.html ./
+COPY history_store.py reviews.py ./
+COPY migrations ./migrations
 COPY static ./static
 
 # 兜底：即使 compose 的 data 卷挂载缺失/宿主目录不存在，扫描结果也能落盘

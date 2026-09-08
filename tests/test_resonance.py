@@ -253,6 +253,8 @@ class IntegrationTests(unittest.TestCase):
     def test_scan_entrypoints_share_cutoff(self):
         stock = dict(code='600519', name='test', theme='', vr=2, turnover=1)
         with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+            stack.enter_context(patch('history_store.archive'))
+            stack.enter_context(patch('history_store.import_legacy'))
             stack.enter_context(patch.object(sc, 'DATA', Path(temp)))
             stack.enter_context(patch.object(sc, 'WATCH_FILE', Path(temp)/'watch.json'))
             stack.enter_context(patch.object(sc, 'load_pool', return_value=[stock,dict(stock,code='000001')]))

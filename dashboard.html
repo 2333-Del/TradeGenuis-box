@@ -184,7 +184,28 @@
     <button class="act go" id="btnScan" type="button">全市场扫描</button>
   </div>
 
-  <section class="card">
+  <nav class="tabs" id="viewTabs" aria-label="功能导航" style="margin:18px 0">
+    <button class="tab on" data-view="live">实时选股</button>
+    <button class="tab" data-view="history">选股历史</button>
+    <button class="tab" data-view="stats">效果统计</button>
+  </nav>
+  <section id="historyView" class="card" hidden>
+    <div class="sec-head"><h3 id="historyTitle">选股历史</h3><span class="mode-tag">原始判断留存 · 手动更新表现</span></div>
+    <div class="history-filters">
+      <label>开始日期<input id="histFrom" type="date"></label><label>结束日期<input id="histTo" type="date"></label>
+      <label>资产<select id="histAsset"><option value="">A股与ETF（分组）</option value="stock">A股</option><option value="etf">ETF</option></select></label>
+      <label>样本<select id="histCategory"><option value="qualified">达标</option><option value="near">临界池</option><option value="all">全部候选</option></select></label>
+      <label>共振<select id="histLevel"><option value="">全部等级</option><option value="strong">强共振</option><option value="soft">准共振</option><option value="near">临界</option></select></label>
+      <label>策略版本<input id="histVersion" placeholder="全部版本" size="12"></label>
+      <label>周期<select id="histPeriod"><option value="1d">日线</option><option value="30m">30分钟</option><option value="1h">1小时</option></select></label>
+      <label>观察窗口<select id="histHorizon"><option value="1">次一交易日</option><option value="3">第三交易日</option><option value="5">第五交易日</option><option value="latest">最近更新</option></select></label>
+      <button class="act" id="histQuery">查询已保存数据</button><button class="act go" id="histUpdateRange">更新所选日期范围</button>
+    </div>
+    <p id="historyMessage" class="history-note" role="status"></p>
+    <p id="reviewProgress" class="history-note" role="status"></p>
+    <div id="historyContent"></div><div id="historyDetail"></div>
+  </section>
+  <section class="card" id="liveView">
     <div class="sec-head">
       <h3 id="cardsTitle">今日达标</h3>
       <span class="mode-tag" id="hotTopics" style="display:none"></span>
@@ -199,6 +220,7 @@
 const periods = ["30m", "1h", "1d"];
 const CARD_LIMIT = 60;   // 默认渲染卡面上限（每张卡带canvas图表，全量渲染几百张会卡死页面）
 const S = { watch: null, crypto: null, status: null, cfg: null, hot: [], loaded: false, kbars: {}, market: "stock", selBoard: null, resFilter: null, cardLimit: CARD_LIMIT };
+let activeView = 'live', quoteTimer = null, liveTimer = null;
 // 图表懒加载：滚动到可视区附近才请求K线
 const chartIO = ("IntersectionObserver" in window) ? new IntersectionObserver(entries => {
   for (const e of entries) if (e.isIntersecting) { chartIO.unobserve(e.target); loadChart(e.target.dataset.code); }
@@ -228,6 +250,7 @@ async function jfetch(path, opts) {
   return r.json();
 }
 async function loadAll() {
+  if (activeView !== 'live') return;
   const [w, c, st, cfg, hot] = await Promise.all([
     jfetch("api/watchlist"),
     jfetch("api/crypto").catch(() => null),
@@ -509,6 +532,7 @@ function drawChart(cv, d) {
 
 /* =============================== 行情自动刷新（3s） =============================== */
 async function refreshQuotes() {
+  if (activeView !== 'live') return;
   if (!S.loaded) return;
   const data = S.market === "crypto" ? (S.crypto || {}) : (S.watch || {});
   const rows = data.candidates || [];
@@ -610,10 +634,15 @@ function boot() {
   });
   $("autoCb").addEventListener("change", () => saveCfg());
   refresh().then(() => refreshQuotes());
-  setInterval(refreshQuotes, 3000);
-  setInterval(() => { if (!scanning) refresh().catch(() => {}); }, 300000);
+  startLiveTimers();
+}
+function startLiveTimers() {
+  clearInterval(quoteTimer); clearInterval(liveTimer);
+  quoteTimer = setInterval(refreshQuotes, 3000);
+  liveTimer = setInterval(() => { if (!scanning && activeView === 'live') refresh().catch(() => {}); }, 300000);
 }
 boot();
 </script>
+<script src="static/history.js"></script>
 </body>
 </html>

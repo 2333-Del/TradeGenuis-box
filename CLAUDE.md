@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with th
 
 ## 概述
 
-TradeGenuis 是一个**多周期共振箱体突破**选股/选ETF/选币看板，基于公开行情接口（腾讯/新浪/东方财富/Binance），零数据库、零 API Key。
+TradeGenuis 是一个**多周期共振箱体突破**选股/选ETF/选币看板，基于公开行情接口（腾讯/新浪/东方财富/Binance），无需行情 API Key。PostgreSQL 保存历史与复盘，最新看板和配置仍使用 JSON。
 
 **双市场**：A股+场内ETF（沪深）+加密货币（Binance USDT 永续）
 
@@ -119,7 +119,7 @@ scanner.py
 ├── server.py           # HTTP 服务器 + 自动调度
 ├── dashboard.html      # 看板页面
 ├── start.sh            # 一键启动脚本
-├── requirements.txt    # 依赖（仅 requests）
+├── requirements.txt    # requests / psycopg连接池 / exchange-calendars
 ├── docker/             # 服务器部署（Dockerfile / compose / ignore / 部署README）
 ├── data/
 │   ├── pool.json       # 自选池（用户维护）
@@ -154,3 +154,11 @@ scanner.py
 notifications.py负责状态变更去重，扫描测试必须mock push_scan或传输；不要在验证过程中使用真实Telegram。
 joinquant_strategy.py内aggregate/evaluate/_level是resonance.py的可粘贴副本，tests/test_regressions.py要求逐字一致；变更引擎时同步这三段并跑测试。qualify/量价确认不进副本，但resonance.SOFT_*与scanner的VOL_*/试盘满分档须手动同步。
 docker/Dockerfile需包含market_data.py和notifications.py（新增Python模块须同步COPY行）。共振等级仍是状态分层，不是直接买入指令。
+
+## 历史复盘约束
+
+`history_store.py` 装饰器统一归档全量、快扫、自选池，扫描级 cutoff 通过 ContextVar 固定，不能从候选行反推批次日期。先写本地 outbox，再事务幂等入 PostgreSQL。历史读取不得重新 qualify；`reviews.py` 的 GET 不调用行情源。
+
+交易日用 XSHG 日历，目标日期不随个股缺失K线后移。NEAR 突破与 BREAK 守住的分母分开，价格尺度不能对齐则不可评估。复盘旧值保留每项 value_as_of 和 stale 标记；成功结果、行情证据及更新状态同事务提交。部分重叠的更新请求返回409，不静默遗漏批次。
+
+Docker新增 PostgreSQL17 命名卷与健康依赖，COPY包含history_store.py、reviews.py、migrations及static。测试只使用独立 HISTORY_TEST_DATABASE_URL，测试会清空该库历史表；扫描单测需mock history_store.archive/import_legacy，禁止测试数据进入真实 outbox。浏览器回归增加 tests/test_history.cjs。

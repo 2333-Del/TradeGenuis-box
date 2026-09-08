@@ -7,6 +7,10 @@ const assert = require('assert');
 
 (async () => {
   const app = http.createServer((req, res) => {
+    if (req.url === '/static/history.js') {
+      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+      res.end(fs.readFileSync(path.join(__dirname, '..', 'static', 'history.js'))); return;
+    }
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.end(fs.readFileSync(path.join(__dirname, '..', 'dashboard.html')));
   });
