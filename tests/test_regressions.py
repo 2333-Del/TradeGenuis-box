@@ -209,6 +209,38 @@ class ResponseTests(unittest.TestCase):
             finally:
                 app.shutdown(); app.server_close(); worker.join()
 
+    def test_watch_payload_cached_until_file_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            file = self.watch_file(tmp)
+            with patch.object(server, 'WATCH_FILE', file), patch.object(server, '_WATCH_CACHE', [None]):
+                p1 = server._watch_payload()
+                with patch.object(server, 'read_json') as rj:   # 同 stat 命中缓存，不再读盘解析
+                    self.assertIs(server._watch_payload(), p1)
+                    rj.assert_not_called()
+                file.write_text(json.dumps(dict(candidates=[dict(code='000001')], pad='y' * 33)), encoding='utf-8')
+                p2 = server._watch_payload()
+                self.assertIsNot(p1, p2)
+                self.assertEqual(p2['candidates'][0]['code'], '000001')
+
+    def test_watchlist_handler_keeps_kline_cache_intact(self):
+        # /api/watchlist 会替换 candidates 键；必须浅拷贝保护共享缓存，
+        # 否则随后的 /api/kline 拿不到 bars，所有图表变空白
+        with tempfile.TemporaryDirectory() as tmp, patch.object(server, 'WATCH_FILE', self.watch_file(tmp)), \
+             patch.object(server, '_WATCH_CACHE', [None]):
+            app = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+            worker = threading.Thread(target=app.serve_forever, daemon=True)
+            worker.start()
+            try:
+                root = f'http://127.0.0.1:{app.server_port}'
+                with urlopen(root + '/api/watchlist') as resp:
+                    self.assertEqual(json.loads(resp.read())['candidates'][0]['code'], '600519')
+                with urlopen(root + '/api/kline?code=600519&interval=1d&market=stock&lmt=100') as resp:
+                    body = json.loads(resp.read())
+                self.assertIsNone(body.get('error'))
+                self.assertEqual(len(body.get('bars') or []), 60)
+            finally:
+                app.shutdown(); app.server_close(); worker.join()
+
 
 class RuleParityTests(unittest.TestCase):
     def test_second_breakout_after_failure(self):
@@ -259,6 +291,76 @@ class NotificationTests(unittest.TestCase):
             sent = [c.kwargs['json']['text'] for c in post.call_args_list]
             self.assertEqual(''.join(sent), '😀中' * 3000)
             self.assertTrue(all(len(t.encode('utf-16-le'))//2 <= 3500 for t in sent))
+
+    def test_feishu_signed_body_and_success(self):
+        with patch.object(sc, 'feishu_credentials', return_value=('https://open.feishu.cn/open-apis/bot/v2/hook/fake', 's3cret')), \
+             patch.object(sc.HTTP, 'post', return_value=Mock(ok=True, json=lambda: {'code': 0, 'msg': 'success'})) as post:
+            self.assertTrue(sc.feishu_send('hello'))
+            body = post.call_args.kwargs['json']
+            self.assertEqual(body['msg_type'], 'text')
+            self.assertEqual(body['content']['text'], 'hello')
+            self.assertIn('timestamp', body)
+            self.assertEqual(body['sign'], sc._feishu_sign(body['timestamp'], 's3cret'))
+            self.assertEqual(len(body['sign']), 44)  # base64(32字节SHA256摘要)
+
+    def test_feishu_unsigned_when_no_secret(self):
+        with patch.object(sc, 'feishu_credentials', return_value=('https://open.feishu.cn/open-apis/bot/v2/hook/fake', '')), \
+             patch.object(sc.HTTP, 'post', return_value=Mock(ok=True, json=lambda: {'code': 0})) as post:
+            self.assertTrue(sc.feishu_send('hi'))
+            body = post.call_args.kwargs['json']
+            self.assertNotIn('sign', body)
+            self.assertNotIn('timestamp', body)
+
+    def test_feishu_error_body_returns_false(self):
+        # 飞书签名错误等仍返回 HTTP 200，必须看响应体
+        with patch.object(sc, 'feishu_credentials', return_value=('https://open.feishu.cn/open-apis/bot/v2/hook/fake', 'bad')), \
+             patch.object(sc.HTTP, 'post', return_value=Mock(ok=True, json=lambda: {'code': 19021, 'msg': 'sign match fail'})):
+            self.assertFalse(sc.feishu_send('hi'))
+
+    def test_feishu_legacy_status_code_zero(self):
+        resp = Mock(ok=True, json=lambda: {'StatusCode': 0, 'StatusMessage': 'success'})
+        with patch.object(sc, 'feishu_credentials', return_value=('https://open.feishu.cn/open-apis/bot/v2/hook/fake', '')), \
+             patch.object(sc.HTTP, 'post', return_value=resp):
+            self.assertTrue(sc.feishu_send('hi'))
+
+    def test_long_feishu_text_is_chunked_without_real_network(self):
+        with patch.object(sc, 'feishu_credentials', return_value=('https://open.feishu.cn/open-apis/bot/v2/hook/fake', '')), \
+             patch.object(sc.HTTP, 'post', return_value=Mock(ok=True, json=lambda: {'code': 0})) as post:
+            self.assertTrue(sc.feishu_send('😀中' * 3000))
+            sent = [c.kwargs['json']['content']['text'] for c in post.call_args_list]
+            self.assertEqual(''.join(sent), '😀中' * 3000)
+            self.assertTrue(all(len(t.encode('utf-16-le'))//2 <= 3500 for t in sent))
+
+    def qualified_row(self):
+        return dict(code='600519', name='test', score=90,
+                    timeframes={p: dict(state='BREAK', box_high=100, breakout_at='a', confirmed_at='b')
+                                for p in ('30m', '1h', '1d')})
+
+    def test_push_scan_dual_channel_independent_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(sc, 'DATA', Path(tmp)), \
+                 patch.object(sc, 'telegram_credentials', return_value=('tk', 'chat')), \
+                 patch.object(sc, 'feishu_credentials', return_value=('https://open.feishu.cn/open-apis/bot/v2/hook/fake', '')), \
+                 patch.object(sc, 'telegram_send', return_value=True) as tg, \
+                 patch.object(sc, 'feishu_send', return_value=True) as fs:
+                self.assertTrue(sc.push_scan([self.qualified_row()], 'market'))
+                self.assertTrue(tg.called and fs.called)
+                self.assertTrue((Path(tmp) / 'telegram_state.json').exists())
+                self.assertTrue((Path(tmp) / 'feishu_state.json').exists())
+                # 单渠道失败不拖累另一渠道；失败渠道状态不落盘（下次重试）
+                (Path(tmp) / 'feishu_state.json').unlink()
+                fs.return_value = False
+                self.assertFalse(sc.push_scan([self.qualified_row()], 'market'))
+                self.assertFalse((Path(tmp) / 'feishu_state.json').exists())
+                self.assertTrue((Path(tmp) / 'telegram_state.json').exists())
+
+    def test_push_scan_skips_unconfigured_channels(self):
+        with patch.object(sc, 'telegram_credentials', return_value=('', '')), \
+             patch.object(sc, 'feishu_credentials', return_value=('', '')), \
+             patch.object(sc, 'telegram_send') as tg, patch.object(sc, 'feishu_send') as fs:
+            self.assertTrue(sc.push_scan([self.qualified_row()], 'market'))
+            tg.assert_not_called()
+            fs.assert_not_called()
 
     def test_scan_worker_calls_push(self):
         with patch.object(sc, 'run_market_scan', return_value=[]), patch.object(sc, 'push_scan', return_value=True) as push, patch.object(server, 'log'):

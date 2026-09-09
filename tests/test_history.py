@@ -140,7 +140,7 @@ class PostgreSQLTests(unittest.TestCase):
 
     def setUp(self):
         # Only an explicitly designated disposable test database may run this destructive cleanup.
-        db.execute('TRUNCATE review_attempts,review_versions,review_observations,review_results,review_jobs,signal_snapshots,scan_batches,trading_calendar CASCADE')
+        db.execute('TRUNCATE review_attempts,review_versions,review_observations,review_results,review_jobs,signal_snapshots,scan_batches,trading_calendar,index_bars CASCADE')
 
     def test_atomic_immutable_and_pagination(self):
         b=batch();db.persist(b);b['rows'][0]['price']=200;db.persist(b)
@@ -160,13 +160,41 @@ class PostgreSQLTests(unittest.TestCase):
         b=batch();db.persist(b)
         identifier=str(uuid.uuid4());payload={'batch_ids':[b['id']],'total':0,'done':0,'errors':[]}
         db.execute("INSERT INTO review_jobs(id,status,payload) VALUES (%s,'running',%s)",(identifier,db.jb(payload)))
+        for day,close in (('2026-09-04',100.0),('2026-09-05',100.2),('2026-09-07',100.5),('2026-09-08',101.0),('2026-09-09',101.2)):
+            db.execute('INSERT INTO index_bars VALUES (%s,%s,%s)',(day,close,'test'))
         _,f=fixture()
-        with patch.object(rv,'fetch_frames',return_value=f):rv.worker(identifier,rv.selected_batches({}),payload)
+        with patch.object(rv,'fetch_frames',return_value=f),patch.object(rv,'refresh_index',return_value=5):
+            rv.worker(identifier,rv.selected_batches({}),payload)
         self.assertEqual(rv.job_detail(identifier)['status'],'partial')
+        self.assertEqual(rv.job_detail(identifier)['payload']['index_days'],5)
         result=rv.stats({})['groups'][0]
         self.assertEqual(result['metrics']['up']['valid'],1)
         self.assertEqual(result['metrics']['breakout']['success'],1)
+        # 信号 1% − 指数同窗口 0.5% = 超额 0.5%
+        self.assertEqual(result['metrics']['excess']['valid'],1)
+        self.assertEqual(result['mean_excess'],0.5)
+        self.assertEqual(result['daily'][0]['date'],'2026-09-04')
+        self.assertEqual(result['daily'][0]['mean_excess'],0.5)
         self.assertEqual(rv.symbol_detail(b['id'],'600001')['observations'],f)
+
+    def test_symbol_chart_uses_latest_successful_observation(self):
+        b=batch();db.persist(b)
+        good=str(uuid.uuid4())
+        db.execute("INSERT INTO review_jobs(id,status,payload) VALUES (%s,'complete',%s)",(good,db.jb({'batch_ids':[b['id']],'total':1,'done':1,'errors':[]})))
+        db.execute("INSERT INTO review_observations VALUES (%s,%s,%s,%s)",
+            (good,'600001','2026-09-05T16:00:00+08:00',db.jb({'1d':{'bars':[bar('2026-09-05',101),bar('2026-09-08',103)]}})))
+        # 复盘结果指向后来一次行情拉取失败的 job（该 job 没有观察帧）：展示应回退到旧的成功帧
+        bad=str(uuid.uuid4())
+        db.execute("INSERT INTO review_jobs(id,status,payload) VALUES (%s,'failed',%s)",(bad,db.jb({'batch_ids':[b['id']],'total':1,'done':1,'errors':[]})))
+        db.execute("INSERT INTO review_results(batch_id,code,job_id,result) VALUES (%s,%s,%s,%s)",
+            (b['id'],'600001',bad,db.jb({'version':1,'as_of':'2026-09-08T16:00:00+08:00','windows':{},'latest':{}})))
+        detail=rv.symbol_detail(b['id'],'600001')
+        self.assertIsNotNone(detail['observations_as_of'])
+        self.assertTrue(detail['observations']['1d']['bars'])
+        chart=rv.symbol_chart(b['id'],'600001','1d')
+        self.assertEqual([x['date'] for x in chart['follow']],['2026-09-05','2026-09-08'])
+        self.assertTrue(chart['bars'])
+        with self.assertRaises(ValueError):rv.symbol_chart(b['id'],'600001','5m')
 
     def test_reuse_running_job(self):
         b=batch();db.persist(b)
@@ -218,6 +246,9 @@ class PostgreSQLTests(unittest.TestCase):
         try:
             with patch.dict(os.environ,{'DASHBOARD_PASSWORD':''}):
                 with urlopen(base+'/api/history/batches') as r:self.assertEqual(json.load(r)['total'],1)
+                with urlopen(base+f'/api/history/batches/{b["id"]}/symbols/600001/kline?interval=1d') as r:
+                    chart=json.load(r)
+                self.assertEqual(chart['interval'],'1d');self.assertTrue(chart['bars'])
                 with self.assertRaises(HTTPError) as err:urlopen(base+'/api/history/batches?page=0')
                 self.assertEqual(err.exception.code,400);err.exception.close()
                 with patch.object(db,'query',side_effect=RuntimeError('secret')):

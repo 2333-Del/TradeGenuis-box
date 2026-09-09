@@ -124,6 +124,46 @@ def fetch_frames(code,as_of):
             continue
     return frames
 
+def latest_observation(code):
+    """该标的最近一次成功拉取的行情证据（跨任务取 fetched_at 最新的一份，不绑定最新 job）。"""
+    rows=db.query('SELECT frames,fetched_at FROM review_observations WHERE code=%s ORDER BY fetched_at DESC LIMIT 1',(code,))
+    return (rows[0]['frames'],rows[0]['fetched_at']) if rows else ({},None)
+
+def refresh_index(start_day,end,as_of):
+    """上证指数日线收盘落库 index_bars（超额收益基准）。指数无除权，不复权即真值。"""
+    import scanner as sc
+    from market_data import daily
+    sym = 'sh000001'   # tx_symbol 会把 000001 映射成平安银行，指数必须带前缀直连
+    raw,source = [],'tencent'
+    try:
+        d=sc.http_json(f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,800,qfq')
+        node=(d.get('data') or {}).get(sym) or {}
+        for k in node.get('qfqday') or node.get('day') or []:
+            try: raw.append(dict(date=str(k[0]),open=float(k[1]),close=float(k[2]),high=float(k[3]),low=float(k[4]),vol=float(k[5])))
+            except (ValueError,IndexError): continue
+    except Exception:
+        raw=[]
+    if len(raw)<30:
+        source='sina'
+        try:
+            d=sc.http_json(f'https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={sym}&scale=240&ma=no&datalen=800')
+            for k in d or []:
+                try: raw.append(dict(date=k['day'],open=float(k['open']),close=float(k['close']),high=float(k['high']),low=float(k['low']),vol=float(k['volume'])))
+                except (ValueError,KeyError): continue
+        except Exception:
+            pass
+    if len(raw)<30:
+        raise RuntimeError('指数日线历史不足')
+    bars=daily(raw,as_of,source=source,adjustment='unadjusted')
+    written=0
+    with db.pool().connection() as c:
+        for b in bars:
+            if start_day<=b['date']<=end:
+                c.execute('INSERT INTO index_bars VALUES (%s,%s,%s) ON CONFLICT(day) DO UPDATE SET close=EXCLUDED.close,source=EXCLUDED.source',
+                    (b['date'],b['close'],source))
+                written+=1
+    return written
+
 def filters(q):
     clauses, args = [],[]
     for key,column in (('from','b.trade_date >= %s'),('to','b.trade_date <= %s')):
@@ -184,9 +224,26 @@ def symbol_detail(identifier,code):
       WHERE s.batch_id=%s AND s.code=%s''',(identifier,code))
     if not rows:raise LookupError('标的不存在')
     row=rows[0]
-    observed=db.query('SELECT frames FROM review_observations WHERE job_id=%s AND code=%s',(row['job_id'],code)) if row.get('job_id') else []
-    row['observations']=observed[0]['frames'] if observed else {}
+    # 行情证据按标的取最近一次成功拉取：最新一次更新若拉取失败，不应连带抹掉更早的可用帧
+    row['observations'],row['observations_as_of']=latest_observation(code)
     return row
+
+def symbol_chart(identifier,code,period):
+    """历史批次单标的K线：原始帧 + 最近成功观察帧中信号日之后的K线（卡片迷你图数据源）。"""
+    if period not in PERIODS:raise ValueError('周期错误')
+    identifier=uuid_str(identifier)
+    if not code.isdigit() or len(code)!=6:raise ValueError('股票代码错误')
+    rows=db.query('''SELECT s.snapshot,b.as_of FROM signal_snapshots s JOIN scan_batches b ON b.id=s.batch_id
+      WHERE s.batch_id=%s AND s.code=%s''',(identifier,code))
+    if not rows:raise LookupError('标的不存在')
+    snapshot,as_of=rows[0]['snapshot'],rows[0]['as_of']
+    frame=(snapshot.get('timeframes') or {}).get(period) or {}
+    observations,observed_at=latest_observation(code)
+    scan_day=str(as_of)[:10]
+    follow=[b for b in ((observations.get(period) or {}).get('bars') or []) if str(b['date'])[:10]>scan_day]
+    return dict(code=code,name=snapshot.get('name'),interval=period,as_of=as_of,
+                observations_as_of=observed_at,bars=frame.get('bars',[])[-160:],
+                box={k:v for k,v in frame.items() if k!='bars'},follow=follow[-80:])
 
 def selected_batches(q):
     if q.get('batch_id'):
@@ -208,27 +265,52 @@ def stats(q):
     rows=db.query('''SELECT s.code,s.asset,s.level,s.category,s.snapshot->>'name' AS name,b.id AS batch_id,b.trade_date,b.version,r.result
        FROM signal_snapshots s JOIN scan_batches b ON b.id=s.batch_id LEFT JOIN review_results r ON r.batch_id=s.batch_id AND r.code=s.code
        WHERE '''+' AND '.join(clauses),args)
+    closes={str(r['day']):float(r['close']) for r in db.query('SELECT day,close FROM index_bars')}
     groups={}
     for row in rows:
         for n in HORIZONS:
             key=(row['asset'],row['version'],n)
             g=groups.setdefault(key,dict(asset=key[0],version=key[1],horizon=n,samples=[],metrics={}))
             result=(row.get('result') or {}).get('windows',{}).get(period,{}).get(str(n),{})
+            # 超额 = 信号收益 − 上证指数同窗口（信号日收盘→目标日收盘）涨跌
+            if result.get('return_pct') is not None:
+                base,target=closes.get(str(row['trade_date'])),closes.get(str(result.get('target_date') or ''))
+                if base and target:
+                    result['excess']=round(result['return_pct']-(target/base-1)*100,6)
+                else:
+                    result.setdefault('errors',{})['excess']='基准收盘缺失'
+            else:
+                result.setdefault('errors',{})['excess']=result.get('errors',{}).get('return_pct','尚未复盘')
             g['samples'].append({k:v for k,v in row.items() if k!='result'} | {'performance':result})
     for g in groups.values():
-        for name,field in (('up','return_pct'),('breakout','breakout'),('held','held')):
+        for name,field in (('up','return_pct'),('breakout','breakout'),('held','held'),('excess','excess')):
             valid=[s['performance'][field] for s in g['samples'] if s['performance'].get(field) is not None]
-            successes=sum(v>0 if name=='up' else bool(v) for v in valid)
+            successes=sum(v>0 if name in ('up','excess') else bool(v) for v in valid)
             excluded=Counter(s['performance'].get('errors',{}).get(field,'尚未复盘') for s in g['samples'] if s['performance'].get(field) is None)
             g['metrics'][name]=dict(success=successes,valid=len(valid),rate=successes/len(valid)*100 if valid else None,excluded=dict(excluded))
-            if name=='up':g.update(mean_return=sum(valid)/len(valid) if valid else None,flat=sum(v==0 for v in valid))
+            if name=='up':
+                g.update(mean_return=sum(valid)/len(valid) if valid else None,flat=sum(v==0 for v in valid))
+                excess=[s['performance']['excess'] for s in g['samples'] if s['performance'].get('excess') is not None]
+                g.update(mean_excess=sum(excess)/len(excess) if excess else None)
+                by_date={}
+                for s in g['samples']:
+                    value=s['performance'].get('return_pct')
+                    if value is None:continue
+                    d=by_date.setdefault(str(s['trade_date']),dict(date=str(s['trade_date']),valid=0,up=0,ret=0.0,excess=[]))
+                    d['valid']+=1;d['ret']+=value
+                    if value>0:d['up']+=1
+                    if s['performance'].get('excess') is not None:d['excess'].append(s['performance']['excess'])
+                g['daily']=[dict(date=d['date'],valid=d['valid'],up=d['up'],rate=d['up']/d['valid']*100,
+                                 mean_return=d['ret']/d['valid'],
+                                 mean_excess=sum(d['excess'])/len(d['excess']) if d['excess'] else None)
+                            for d in sorted(by_date.values(),key=lambda x:x['date'])]
     dates={str(b['trade_date']) for b in chosen}
     missing=[]
     if q.get('from') and q.get('to'):
         # Read-only: do not fetch or construct a calendar in a GET request.
         missing=[str(r['day']) for r in db.query('SELECT day FROM trading_calendar WHERE is_open AND day BETWEEN %s AND %s',(q['from'],q['to'])) if str(r['day']) not in dates]
     return dict(groups=list(groups.values()),batches=len(chosen),missing_dates=missing,
-                note='每日信号样本，跨日重复入选重复计数；非独立交易次数。交易日历未覆盖的日期不推算。')
+                note='每日信号样本，跨日重复入选重复计数；非独立交易次数。超额为相对上证指数同窗口涨跌。交易日历未覆盖的日期不推算。')
 
 def start(q):
     if not isinstance(q,dict):raise ValueError('请求必须为对象')
@@ -292,6 +374,10 @@ def worker(identifier,chosen,payload):
         import exchange_calendars as xc
         end=min(end,xc.get_calendar('XSHG').last_session.strftime('%Y-%m-%d'))
         days=calendar_days(start_day,end)
+        try:
+            payload['index_days']=refresh_index(start_day,end,as_of)
+        except Exception as exc:
+            payload['index_error']=type(exc).__name__   # 基准缺失只降级超额指标，不影响信号复盘
         rows=db.query('SELECT s.*,b.trade_date FROM signal_snapshots s JOIN scan_batches b ON b.id=s.batch_id WHERE s.batch_id=ANY(%s)',([b['id'] for b in chosen],))
         payload['total']=len(rows)
         cache={}

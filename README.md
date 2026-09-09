@@ -16,7 +16,7 @@
 - **结果优先的图形化看板**：只展示达标标的，每张卡片内嵌 K 线（含成交量、箱体虚线、悬浮十字提示）、四条件状态、评分徽章
 - **自动扫描调度**：每个交易日 11:30（午间收盘）/ 15:00（收盘）各扫一次，服务端常驻调度
 - **实时行情刷新**：达标标的每 3 秒静默刷新价格/涨跌
-- **Telegram 推送**（可选）：扫描结果推送至群/私聊
+- **Telegram / 飞书推送**（可选）：扫描结果推送至 Telegram 群/私聊或飞书群，双渠道独立开关
 - **历史与复盘**：PostgreSQL 保存不可变选股快照，按交易日手动更新 1／3／5 日信号表现；实时结果继续使用 JSON。
 - **零行情 API Key**：依赖公开接口（腾讯/新浪/东方财富/Binance）。
 
@@ -52,7 +52,11 @@ python3 scanner.py              # 自选池（data/pool.json）
 
 看板横幅「关注板块」输入框添加，存于 `data/sectors.json`。系统会将你填写的板块名**自动匹配到东方财富概念板块分类**，纳入扫描范围（与当日涨幅前 3 板块并列）。
 
-## Telegram 推送（可选）
+## 消息推送（Telegram / 飞书，可选）
+
+两个渠道完全独立：配置了哪个就发哪个，都没配置则不推送；去重状态各自保存在 `data/telegram_state.json` / `data/feishu_state.json`，单渠道失败不影响另一渠道（下次扫描自动重试）。
+
+### Telegram
 
 1. `@BotFather` 建 Bot 拿 Token；给 Bot 发条消息后访问 `https://api.telegram.org/bot<TOKEN>/getUpdates` 查 `chat.id`
 2. 配置：
@@ -60,18 +64,38 @@ python3 scanner.py              # 自选池（data/pool.json）
 ```bash
 export TG_BOT_TOKEN=123456:ABC
 export TG_CHAT_ID=123456789
-python3 scanner.py --test-push   # 连通测试
+```
+
+也可把 Token/Chat ID 写入 `data/config.json` 的 `tg_token` / `tg_chat`（环境变量优先）。
+
+### 飞书（群自定义机器人 Webhook）
+
+1. 飞书目标群 → 设置 → 群机器人 → 添加「自定义机器人」，复制 Webhook 地址（`https://open.feishu.cn/open-apis/bot/v2/hook/xxxx`）
+2. 安全设置三选一：**签名校验**（推荐，密钥填 `FEISHU_SECRET`）/ 自定义关键词（建议用「共振」，推送消息固定含此词）/ IP 白名单
+3. 配置：
+
+```bash
+export FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxxx
+export FEISHU_SECRET=your-sign-secret   # 仅签名校验模式需要
+```
+
+也可写入 `data/config.json` 的 `feishu_webhook` / `feishu_secret`（环境变量优先）。
+
+### 连通测试与推送
+
+```bash
+python3 scanner.py --test-push   # 连通测试（逐渠道汇报成功/失败）
 python3 scanner.py --push        # 扫描并推送
 ```
 
-也可在看板 banner 里直接填 Token/Chat ID（保存到 `data/config.json`，`--push` 会自动读取）。
+注意：加签模式要求服务器时钟与标准时间偏差小于 1 小时（容器需正常 NTP）；飞书自定义机器人限频 100 条/分钟，本项目消息量远低于此。
 
 ## 文件结构
 
 | 文件 | 说明 |
 |---|---|
 | `start.sh` | 一键启动脚本（装依赖 + 首次扫描 + 起服务） |
-| `scanner.py` | 扫描引擎：拉数据 → 四条件打分 → 写 JSON / 推 Telegram |
+| `scanner.py` | 扫描引擎：拉数据 → 四条件打分 → 写 JSON / 推送（Telegram/飞书） |
 | `server.py` | 本地看板服务器（纯标准库，默认端口 8808） |
 | `dashboard.html` | 看板页（TradeGenuis 深色主题，自托管字体） |
 | `docker/` | 服务器部署（Dockerfile / compose / 部署说明） |
@@ -121,7 +145,7 @@ Docker 相关内容（Dockerfile / compose / ignore 规则 / 部署细节）集�
 ```bash
 # 0. 确保数据目录存在（git clone 出来的仓库里没有它，缺了会导致扫描结果落盘失败）
 mkdir -p data
-# 1. 配置：复制模板并填密码 / Telegram（docker/.env 已 gitignore，不会提交）
+# 1. 配置：复制模板并填密码 / 推送渠道（docker/.env 已 gitignore，不会提交）
 cp docker/.env.example docker/.env && vi docker/.env
 # 2. 构建并启动（在仓库根执行）
 docker compose -f docker/docker-compose.yml up -d --build
@@ -134,7 +158,7 @@ docker compose -f docker/docker-compose.yml logs -f
 - 构建上下文是仓库根；数据卷挂到仓库根 `data/`（compose 里 `../data`）持久化：扫描结果、自选池、universe/ETF/概念缓存、配置
 - 不设置 `DASHBOARD_PASSWORD` 时服务只允许本机访问（容器场景等于全部拒绝），公网部署必设
 - 建议由 Nginx/Caddy 反代加 HTTPS 后再暴露公网；compose 里可把端口绑定改为 `127.0.0.1:12300:8808`
-- Telegram 推送：在 compose 的 environment 里补 `TG_BOT_TOKEN` / `TG_CHAT_ID`
+- Telegram 推送：在 compose 的 environment 里补 `TG_BOT_TOKEN` / `TG_CHAT_ID`；飞书推送：补 `FEISHU_WEBHOOK_URL` / `FEISHU_SECRET`
 
 **服务器限流须知**：行情源全部为公开接口。云服务器 IP 属机房段，东财 clist（股票/ETF 清单）风控比家用宽带严；看板行情刷新已改为腾讯批量接口（一次 50 只），常驻压力很小。若清单接口被限流，扫描自动降级（缓存兜底、当日列表为空），次日自动恢复。必要时把 `MARKET_WORKERS` 降到 4 进一步减少压力。
 
@@ -148,20 +172,23 @@ docker compose -f docker/docker-compose.yml logs -f
 - universe仅复用证券清单，每次扫描批量更新报价；失败的报价字段为空，不沿用旧价格。ETF动态清单缓存缩短至60秒。股东户数按获取时刻每日检查更新，空概念不缓存30天。
 - 腾讯报价网络/解析异常均进入同花顺兜底；东财冷却期间跳过对应主机；资金流主源冷却后可恢复；同花顺当日条覆盖同日期历史条。
 - 后端强/准/临界排序修正，前端只刷新可见卡片，列表可加载更多。落盘 `data_health` 汇总全部计算行的数据健康状态，不能再以裁剪后行数推断失败率。
-- 配置Telegram后，服务端扫描结束调用通知。A股/ETF只推送新达标/变化/明确失效，状态保存在 `data/telegram_state.json`；未变化不重复发送，数据失败不当作信号失效。临界池不推送。消息分别列出三个周期的箱顶和确认时间，超长消息分片。测试仅使用模拟发送。
+- 图表按需加载性能修复：watchlist 快照（18MB+）在服务端按 (mtime,size) 缓存解析结果（扫描落盘自动失效），`/api/kline` 单请求从 ~440ms 降到 ~15ms——此前滚动列表触发的几十个图表请求在 GIL 下排队近半分钟，表现为"滚动下去图表空白、周期切换无响应"。前端 K 线缓存只在扫描落地（as_of 变化）时清空，周期选择跨重渲染保留（不再被重置回 1d）。
+- 配置推送渠道（Telegram 或飞书）后，服务端扫描结束调用通知。A股/ETF只推送新达标/变化/明确失效，状态保存在 `data/telegram_state.json` / `data/feishu_state.json`（按渠道独立，失败不落盘可重试）；未变化不重复发送，数据失败不当作信号失效。临界池不推送。消息分别列出三个周期的箱顶和确认时间，超长消息分片。测试仅使用模拟发送。
 - 聚宽版取消会漏选的滚动最高价剪枝；纯计算函数与线上逐字对账测试，小时K由同一30m序列聚合。其交易统计使用实际成交且仅在完整平仓后计数；自定义单笔收益为成交价毛收益，净收益以平台含成本报告为准。ST过滤、持仓与交易执行仍是该回测的额外规则，不等于整个看板策略已验证。
 
-验证：`python -m unittest discover -s tests -v`；浏览器回归需 `npm install --no-save playwright` 后 `node tests/test_dashboard.cjs`（使用系统Edge）。测试拦截所有行情/Telegram请求，不产生真实推送。
+验证：`python -m unittest discover -s tests -v`；浏览器回归需 `npm install --no-save playwright` 后 `node tests/test_dashboard.cjs`（使用系统Edge）。测试拦截所有行情/推送请求，不产生真实推送。
 
 ## 选股历史与效果复盘
 
-顶部「选股历史」按日期和扫描批次查看 A股／ETF。当时的报价、各周期箱顶、评分、信号和 K 线不可变；点击「更新本批次表现」或选择日期范围后手动复盘。历史和统计页面不会自动请求行情。
+顶部「选股历史」按日期和扫描批次查看 A股／ETF，批次明细为带迷你K线的卡片（原始K线＋选出后K线拼接，金色虚线标出选出日，滚动到可视区才加载）。当时的报价、各周期箱顶、评分、信号和 K 线不可变；点击「更新本批次表现」或选择日期范围后复盘。历史和统计页面不会自动请求行情。
 
 - 默认汇总每天最后一次收盘全量扫描；没有该批次的日期不拿午盘或快扫补位。A股、ETF和策略版本分组，临界池独立筛选。
 - 窗口为选出日期之后第 1／3／5 个市场交易日，使用 `exchange_calendars` 的 XSHG 日历；超出已发布日历范围不推算工作日。
 - 上涨率：目标收盘价相对当时有效报价上涨的比例。突破率：原 NEAR 样本收盘严格高于原箱顶 × 1.005；守住率：原 BREAK 样本收盘高于原箱顶。指标是信号表现，不是交易收益或交易胜率。
+- 超额收益：信号收益减去上证指数同窗口（信号日收盘→目标日收盘）涨跌；指数日线由复盘任务落库 `index_bars`，取不到时样本标注「基准收盘缺失」并排除分母。效果统计页提供按日胜率与平均涨跌、按日超额、涨跌分布直方图三张图。
+- 自动复盘：默认每个交易日 16:00（`auto_review_time` 可配）滚动更新近三周批次的 1/3/5 日表现，等正在运行的全市场扫描结束后才取行情；看板横幅「自动复盘」开关（`config.auto_review`）。手动更新入口保留。
 - 停牌／无成交、缺失行情、未到观察期、无法对齐复权尺度分别标注并排除相应分母。跨日重复入选按每日信号样本计数。
-- 公开分钟行情历史有限，久远批次可能无法补足 30m／1h 表现。日线与分钟分开保存，获取不到不会虚构数据。刷新失败保留旧有效指标，并显示旧结果标记和失败原因。
+- 公开分钟行情历史有限，久远批次可能无法补足 30m／1h 表现。日线与分钟分开保存，获取不到不会虚构数据。刷新失败保留旧有效指标，并显示旧结果标记和失败原因。行情证据按标的取最近一次成功拉取的帧（`observations_as_of` 披露），不绑定最新任务。
 - 扫描先写 `data/history_outbox`，再事务提交 PostgreSQL；断线时显示待归档，服务每30秒重试。历史唯一批次ID保证重复重试不重复入库。队列所在磁盘也不可写时明确报错。
 - 首次启动将现存 `watchlist.json` 幂等导入为旧数据，默认不进入汇总；不能恢复此前已经被覆盖的扫描。
 
@@ -169,6 +196,6 @@ Docker 使用应用＋PostgreSQL 17，配置、数据卷和备份恢复见 [部�
 
 新增模块：`history_store.py`（连接池／迁移／归档），`reviews.py`（复盘／查询），`migrations/`（版本化DDL），`static/history.js`（历史与统计页面）。历史API与复盘API沿用看板认证。
 
-验证：`python -m unittest discover -s tests -v`；设置 **独立可清空测试库** `HISTORY_TEST_DATABASE_URL` 可运行真实 PostgreSQL 集成测试（会清空该库的历史表）。浏览器测试为 `node tests/test_dashboard.cjs` 和 `node tests/test_history.cjs`，仅使用模拟行情，不发送 Telegram。
+验证：`python -m unittest discover -s tests -v`；设置 **独立可清空测试库** `HISTORY_TEST_DATABASE_URL` 可运行真实 PostgreSQL 集成测试（会清空该库的历史表）。浏览器测试为 `node tests/test_dashboard.cjs` 和 `node tests/test_history.cjs`，仅使用模拟行情，不发送真实推送。
 
 聚宽接口参考：[官方数据API说明](https://www.joinquant.com/help/api/doc?id=9875&name=JQDatadoc)。本地测试不替代聚宽平台回测。

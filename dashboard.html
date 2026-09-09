@@ -174,6 +174,9 @@
     <label class="pill autodrop" title="每个交易日午间收盘与收盘自动全市场扫描">
       <input type="checkbox" id="autoCb" /><span>自动扫描</span><span class="mode-tag" id="autoTimes">11:30 / 15:00</span>
     </label>
+    <label class="pill autodrop" title="每个交易日收盘后自动复盘：滚动更新近三周信号的1/3/5日表现">
+      <input type="checkbox" id="reviewCb" /><span>自动复盘</span><span class="mode-tag" id="reviewTime">16:00</span>
+    </label>
     <span class="grow"></span>
     <div class="tabs" id="marketTabs">
       <button class="tab on" data-market="stock" type="button">A股</button>
@@ -219,7 +222,7 @@
 "use strict";
 const periods = ["30m", "1h", "1d"];
 const CARD_LIMIT = 60;   // 默认渲染卡面上限（每张卡带canvas图表，全量渲染几百张会卡死页面）
-const S = { watch: null, crypto: null, status: null, cfg: null, hot: [], loaded: false, kbars: {}, market: "stock", selBoard: null, resFilter: null, cardLimit: CARD_LIMIT };
+const S = { watch: null, crypto: null, status: null, cfg: null, hot: [], loaded: false, kbars: {}, market: "stock", selBoard: null, resFilter: null, cardLimit: CARD_LIMIT, periodSel: {} };
 let activeView = 'live', quoteTimer = null, liveTimer = null;
 // 图表懒加载：滚动到可视区附近才请求K线
 const chartIO = ("IntersectionObserver" in window) ? new IntersectionObserver(entries => {
@@ -258,7 +261,8 @@ async function loadAll() {
     jfetch("api/config").catch(() => null),
     jfetch("api/hot").catch(() => ({ hot_topics: [] })),
   ]);
-  S.kbars = {};
+  // 只有新扫描落地（as_of 变化）才清K线缓存；5分钟轮询不再触发全量图表重拉
+  if ((S.watch && w && S.watch.as_of !== w.as_of) || (S.crypto && c && S.crypto.as_of !== c.as_of)) S.kbars = {};
   S.watch = w; S.crypto = c; S.status = st; S.cfg = cfg; S.hot = hot.hot_topics || []; S.loaded = true;
   renderAll();
 }
@@ -316,6 +320,8 @@ function renderCfg() {
   if (!S.cfg) return;
   $("autoCb").checked = !!S.cfg.auto;
   $("autoTimes").textContent = (S.cfg.auto_times || ["11:30", "15:00"]).join(" / ");
+  $("reviewCb").checked = !!S.cfg.auto_review;
+  $("reviewTime").textContent = S.cfg.auto_review_time || "16:00";
   // 市场 tab 状态
   document.querySelectorAll("#marketTabs .tab").forEach(t => {
     t.classList.toggle("on", t.dataset.market === S.market);
@@ -413,7 +419,7 @@ function cardHTML(r, i) {
     ${!isCrypto ? `<div class="sig-line resonance">
       <b>共振 ${({ strong: "强", soft: "准", near: "临界", none: "—" })[r.resonance_level] || "—"}</b>
       ${periods.map(tfSpan).join('')}
-      <label>图表 <select aria-label="K线周期" onchange="loadChart('${r.code}', this.value)">${periods.map(p => `<option value="${p}" ${p === '1d' ? 'selected' : ''}>${p}</option>`).join('')}</select></label>
+      <label>图表 <select aria-label="K线周期" onchange="onPeriod('${r.code}', this.value)">${periods.map(p => `<option value="${p}" ${p === (S.periodSel[r.code] || '1d') ? 'selected' : ''}>${p}</option>`).join('')}</select></label>
       <span data-confirm></span></div>` : ''}
     <div class="sig-chart"><canvas height="264" data-code="${r.code}" data-market="${S.market}"></canvas><div class="tip" data-code="${r.code}"></div></div>
     <div class="sig-line">
@@ -423,6 +429,12 @@ function cardHTML(r, i) {
       <span class="box">${isCrypto ? "箱体" : isEtf ? "日线箱体" : "原评分日线箱体"} ${fmt2(r.box_low)}–${fmt2(r.box_high)}</span>
     </div>
   </article>`;
+}
+
+// 周期切换：记住用户选择，renderAll 重建卡片后不回退到 1d
+function onPeriod(code, val) {
+  S.periodSel[code] = val;
+  loadChart(code, val);
 }
 
 async function ensureK(code, interval, market) {
@@ -452,7 +464,7 @@ async function loadChart(code, interval) {
   drawChart(cv, d);
 }
 
-function drawChart(cv, d) {
+function drawChart(cv, d, opts) {
   const code = cv.dataset.code;
   const market = cv.dataset.market || "stock";
   const isCrypto = market === "crypto";
@@ -504,6 +516,17 @@ function drawChart(cv, d) {
       ctx.save(); ctx.strokeStyle = "#8FC98B"; ctx.setLineDash([2, 3]);
       ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, vh); ctx.stroke(); ctx.restore();
       ctx.fillStyle = "#8FC98B"; ctx.fillText("突破", Math.min(x, W - padR - 26), padT + 10);
+    }
+  }
+  // 历史复盘：信号日分隔线（原始K线与选出后K线拼接时标注）
+  const signalDay = opts && opts.signal_date;
+  if (signalDay) {
+    const i = bars.findIndex(b => String(b.date).slice(0, 10) === signalDay);
+    if (i >= 0) {
+      const x = padL + i * step + step / 2;
+      ctx.save(); ctx.strokeStyle = "#E8C468"; ctx.setLineDash([2, 3]);
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, vh + 10 + volH); ctx.stroke(); ctx.restore();
+      ctx.fillStyle = "#E8C468"; ctx.fillText("选出", Math.max(padL + 2, Math.min(x, W - padR - 26)), padT + 22);
     }
   }
   ctx.fillStyle = "rgba(229,212,182,.4)"; ctx.textAlign = "right";
@@ -588,7 +611,7 @@ async function doScan(mode) {
 async function saveCfg() {
   try {
     const r = await jfetch("api/config", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ auto: $("autoCb").checked }) });
+      body: JSON.stringify({ auto: $("autoCb").checked, auto_review: $("reviewCb").checked }) });
     S.cfg = r.config;
     toast("已保存");
   } catch (e) { toast("保存失败"); }
@@ -633,6 +656,7 @@ function boot() {
     renderAll();
   });
   $("autoCb").addEventListener("change", () => saveCfg());
+  $("reviewCb").addEventListener("change", () => saveCfg());
   refresh().then(() => refreshQuotes());
   startLiveTimers();
 }

@@ -24,6 +24,7 @@ TradeGenuis · 箱体突破 本地看板服务器
   会话 token 存内存，重启进程即全部失效。
 
 自动扫描调度：config.auto 开启时，每个交易日 11:30 与 15:00 自动执行全市场扫描。
+自动复盘调度：config.auto_review 开启时，每个交易日 16:00（auto_review_time 可配）滚动更新近三周信号表现。
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ import secrets
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -56,8 +57,12 @@ AUTH_MAX_AGE = 7 * 24 * 3600   # 会话有效期（秒）；服务端 token 重�
 DEFAULT_CONFIG = {
     "auto": True,                       # 自动扫描开关
     "auto_times": ["11:30", "15:00"],   # 交易日午间收盘 / 收盘
+    "auto_review": True,                # 收盘后自动复盘：滚动更新近期信号 1/3/5 日表现
+    "auto_review_time": "16:00",
     "tg_token": "",
     "tg_chat": "",
+    "feishu_webhook": "",
+    "feishu_secret": "",                # 仅飞书机器人启用「签名校验」时需要
 }
 
 STATE = {
@@ -67,6 +72,7 @@ STATE = {
     "kline_cache": {},
     "quote_cache": {},         # code -> (ts, payload) 2.5s 内存缓存
     "auto_done": set(),        # 已触发的自动扫描时间键 "YYYY-MM-DD HH:MM"
+    "reviewing": False,        # 自动复盘监控线程运行中
     "config": dict(DEFAULT_CONFIG),
     "auth_tokens": set(),      # 已登录会话 token（内存态，重启清空）
 }
@@ -163,30 +169,87 @@ def scan_worker(mode: str = "pool", top: int = sc.MARKET_TOP) -> None:
         log(f"扫描完成：{len(rows)} 只，达标 {sum(1 for r in rows if r.get('qualified'))} 只")
         STATE["last_scan"] = sc.now_str()
         if not sc.push_scan(rows, "market" if mode in ("market", "quick") else mode):
-            log("扫描完成，但 Telegram 推送失败；下次扫描重试")
+            log("扫描完成，但推送失败（Telegram/飞书）；下次扫描重试")
     except Exception as e:
         log(f"扫描失败: {e}")
     finally:
         STATE["scanning"] = False
 
 
+AUTO_REVIEW_WINDOW_DAYS = 21   # 自动复盘滚动窗口：覆盖 5 个交易日视界 + 节假日缓冲
+
+
+def auto_review_worker() -> None:
+    """收盘后自动复盘：滚动更新近 N 天批次的 1/3/5 日表现。
+
+    等正在跑的全市场扫描结束再取行情，避免两个任务争抢行情源；
+    任务冲突 / 无批次 / 数据库未配置都只记日志，不影响看板。"""
+    try:
+        STATE["reviewing"] = True
+        waited = 0
+        while STATE["scanning"] and waited < 3600:
+            time.sleep(60)
+            waited += 60
+        end = datetime.now(sc.BJT).date()
+        start = (end - timedelta(days=AUTO_REVIEW_WINDOW_DAYS)).isoformat()
+        task = reviews.start({"from": start, "to": end.isoformat()})
+        log(f"自动复盘任务已创建（{start} ~ {end}）")
+        last_note = ""
+        while True:
+            time.sleep(10)
+            try:
+                job = reviews.job_detail(task["id"])
+            except Exception:
+                break
+            payload = job.get("payload") or {}
+            if job["status"] == "running":
+                note = f"{payload.get('done', 0)}/{payload.get('total', 0)}"
+                if note != last_note:
+                    log(f"自动复盘进行中：{note}")
+                    last_note = note
+                continue
+            errors = len(payload.get("errors") or [])
+            label = {"complete": "完成", "partial": "部分失败"}.get(job["status"], job["status"])
+            log(f"自动复盘{label}：{payload.get('done', 0)}/{payload.get('total', 0)}，失败 {errors} 项"
+                + (f"（基准指数未更新：{payload.get('index_error')}）" if payload.get("index_error") else ""))
+            break
+    except reviews.ReviewConflict as e:
+        log(f"自动复盘跳过（{e}）")
+    except (ValueError, RuntimeError) as e:
+        log(f"自动复盘未执行：{e}")
+    except Exception as e:
+        log(f"自动复盘失败: {e}")
+    finally:
+        STATE["reviewing"] = False
+
+
 def scheduler_loop() -> None:
-    """交易日 11:30 / 15:00 自动全市场扫描（config.auto 开启时）。"""
+    """交易日 11:30 / 15:00 自动全市场扫描；16:00（可配）自动复盘（config 开启时）。"""
     while True:
         try:
             with LOCK:
                 auto = STATE["config"].get("auto", True)
                 times = STATE["config"].get("auto_times") or []
+                review_auto = STATE["config"].get("auto_review", True)
+                review_time = STATE["config"].get("auto_review_time") or "16:00"
             now = datetime.now(sc.BJT)
-            if auto and now.weekday() < 5 and not STATE["scanning"]:
+            if now.weekday() < 5:
                 hm = now.strftime("%H:%M")
-                for t in times:
-                    key = f"{now.strftime('%Y-%m-%d')} {t}"
-                    if hm == t and key not in STATE["auto_done"]:
+                today = now.strftime("%Y-%m-%d")
+                if auto and not STATE["scanning"]:
+                    for t in times:
+                        key = f"{today} {t}"
+                        if hm == t and key not in STATE["auto_done"]:
+                            STATE["auto_done"].add(key)
+                            log(f"自动扫描触发（{t}）…")
+                            threading.Thread(target=scan_worker, args=("market",), daemon=True).start()
+                            break
+                if review_auto and not STATE["reviewing"]:
+                    key = f"{today} R{review_time}"
+                    if hm == review_time and key not in STATE["auto_done"]:
                         STATE["auto_done"].add(key)
-                        log(f"自动扫描触发（{t}）…")
-                        threading.Thread(target=scan_worker, args=("market",), daemon=True).start()
-                        break
+                        log(f"自动复盘触发（{review_time}）…")
+                        threading.Thread(target=auto_review_worker, daemon=True).start()
         except Exception:
             pass
         time.sleep(20)
@@ -199,6 +262,27 @@ def read_json(path: Path, default):
     except Exception:
         pass
     return default
+
+
+# watchlist 快照解析缓存：文件 18MB+，每次 /api/kline 全量解析要 ~0.4s（GIL 串行），
+# 滚动触发几十个图表请求会排成长队（表现为图表迟迟不渲染）。按 (路径, mtime, size)
+# 缓存解析结果，扫描落盘后自动失效。共享的 payload 只读；需要改写的调用方先浅拷贝。
+_WATCH_CACHE: list = [None]   # [(key, payload)]，单槽位赋值原子，避免多线程撕裂
+
+
+def _watch_payload() -> dict:
+    try:
+        st = WATCH_FILE.stat()
+        key = (str(WATCH_FILE), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None   # 文件暂不可见时不缓存，下次再试
+    hit = _WATCH_CACHE[0]
+    if key is not None and hit and hit[0] == key:
+        return hit[1]
+    payload = read_json(WATCH_FILE, {"as_of": None, "candidates": []})
+    if key is not None:
+        _WATCH_CACHE[0] = (key, payload)
+    return payload
 
 
 def public_row(row: dict) -> dict:
@@ -275,7 +359,7 @@ def get_kline(code: str, lmt: int = 160, market: str = "stock", interval: str = 
     if interval not in sc.rs.PERIODS or (market == "crypto" and interval != "1d"):
         return {"error": "unsupported interval"}
     if market == "stock":
-        rows = read_json(WATCH_FILE, {}).get("candidates", [])
+        rows = _watch_payload().get("candidates", [])
         row = next((r for r in rows if r.get("code") == code), {})
         row = sc.rs.qualify(row)
         frame = row.get("timeframes", {}).get(interval)
@@ -426,7 +510,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json({"error": "not found"}, 404)
         elif p == "/api/watchlist":
-            payload = read_json(WATCH_FILE, {"as_of": None, "candidates": []})
+            payload = dict(_watch_payload())   # 浅拷贝：下方要替换 candidates 键，不能污染共享缓存
             # 列表页只用状态/评分/箱体标量（图表走 /api/kline 按需拉）；
             # 剥掉 timeframes[].bars，首屏从十几 MB 降到几十 KB
             payload["candidates"] = [public_row(sc.rs.qualify(r))
@@ -443,9 +527,10 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 self._json({
                     "scanning": STATE["scanning"],
+                    "reviewing": STATE["reviewing"],
                     "last_scan": STATE["last_scan"],
                     "scan_log": STATE["scan_log"][-12:],
-                    "as_of": (read_json(WATCH_FILE, {}) or {}).get("as_of"),
+                    "as_of": _watch_payload().get("as_of"),
                     "is_trading_time": sc.is_trading_time(),
                     "archive": dict(history_store.STATE),
                 })
@@ -549,6 +634,8 @@ class Handler(BaseHTTPRequestHandler):
             elif p=='/api/review-stats': result=reviews.stats(q)
             elif len(parts)==3 and parts[1]=='reviews': result=reviews.job_detail(parts[2])
             elif len(parts)==4 and parts[1:3]==['history','batches']: result=reviews.batch_detail(parts[3],q)
+            elif len(parts)==7 and parts[1:3]==['history','batches'] and parts[4]=='symbols' and parts[6]=='kline':
+                result=reviews.symbol_chart(parts[3],parts[5],q.get('interval','1d'))
             elif len(parts)==6 and parts[1:3]==['history','batches'] and parts[4]=='symbols': result=reviews.symbol_detail(parts[3],parts[5])
             else: raise LookupError('接口不存在')
             self._json(result)

@@ -69,6 +69,9 @@ const assert = require('assert');
       page.getByLabel('K线周期').selectOption('1h')
     ]);
     await page.waitForLoadState('networkidle');
+    // 周期选择跨重渲染保留（回归：renderAll 重建卡片曾把 select 重置回 1d）
+    await page.evaluate(() => renderAll());
+    assert.equal(await page.locator('select[aria-label="K线周期"]').first().inputValue(), '1h');
     assert(requests.includes('30m') && requests.includes('1h') && requests.includes('1d'), JSON.stringify({requests,errors}));
     assert((await page.locator('[data-confirm]').innerText()).includes('突破：'));
     extra = Array.from({length:125}, (_, i) => ({...row, code:String(600100+i), score:50,

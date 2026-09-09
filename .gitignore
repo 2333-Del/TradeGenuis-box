@@ -25,3 +25,6 @@ data/history_outbox/
 data/history_imported
 data/test_pg/
 data/history_test_artifacts/
+
+# AI 工具本地目录
+.zcode/

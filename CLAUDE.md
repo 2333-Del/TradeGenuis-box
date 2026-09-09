@@ -37,8 +37,8 @@ python3 scanner.py              # 自选池（data/pool.json）
 # 测试
 python3 -m unittest tests.test_resonance   # 共振规则/集成测试
 
-# Telegram 推送
-python3 scanner.py --test-push  # 连通测试
+# 消息推送（Telegram / 飞书，均可选，双渠道独立）
+python3 scanner.py --test-push  # 连通测试（逐渠道汇报）
 python3 scanner.py --push       # 扫描并推送
 ```
 
@@ -138,11 +138,11 @@ scanner.py
 | GET | `/` | 看板页 |
 | GET | `/api/watchlist` | A股扫描结果 |
 | GET | `/api/crypto` | 币圈扫描结果 |
-| GET | `/api/kline?code=&market=` | 含箱体标注的 K 线 |
+| GET | `/api/kline?code=&market=` | 含箱体标注的 K 线（读 `_watch_payload()` 快照缓存，勿直接改写共享 payload；改写先浅拷贝，缓存按 (path,mtime,size) 随扫描落盘失效） |
 | GET | `/api/quotes?codes=` | 批量实时行情 |
 | GET | `/api/status` | 扫描状态/日志 |
 | POST | `/api/scan` | 触发扫描 `{mode: market\|quick\|pool\|crypto}` |
-| GET/POST | `/api/config` | 配置（自动扫描/Telegram） |
+| GET/POST | `/api/config` | 配置（自动扫描/推送渠道凭证：tg_token、tg_chat、feishu_webhook、feishu_secret） |
 | GET/POST | `/api/pool` | 自选池管理 |
 
 
@@ -151,7 +151,7 @@ scanner.py
 日K规范化和已收盘过滤位于market_data.py；Bars携带source/adjustment，切片前后必须保留。1d前复权口径不能被不复权兜底静默替换。旧resonance_version快照不可确认为达标。
 分钟行情三源兜底：腾讯mkline→新浪getKLineData→东财push2his（em.minute_kline_raw，部分网络被路径级重置）。三源时间戳均为结束时刻、盘中含未来戳半根K，由aggregate的cutoff统一过滤；换源只重试分钟侧，日线侧失败（不复权/日线缺失/除权漂移）是源无关的终局错误。实际来源写在`timeframes[p].source`。
 除权防御在fetch_stock_timeframes：factor_drift（market_data.py）对比分钟聚合日线与前复权日线的同日收盘比，尾部/头部漂移>0.3%即拒绝确认——未复权分钟箱体会被除权跳空污染。
-notifications.py负责状态变更去重，扫描测试必须mock push_scan或传输；不要在验证过程中使用真实Telegram。
+notifications.py负责状态变更去重（渠道无关），扫描测试必须mock push_scan或传输；不要在验证过程中使用真实Telegram/飞书推送。push_scan双渠道并存：telegram_send/feishu_send各自独立凭证（env优先，data/config.json兜底）与状态文件（telegram_state.json/feishu_state.json），单渠道失败不落盘、不影响另一渠道；飞书为群自定义机器人Webhook（msg_type=text，签名校验时附timestamp+sign，成功判定响应体code/StatusCode==0，HTTP 200也可能是错误）。
 joinquant_strategy.py内aggregate/evaluate/_level是resonance.py的可粘贴副本，tests/test_regressions.py要求逐字一致；变更引擎时同步这三段并跑测试。qualify/量价确认不进副本，但resonance.SOFT_*与scanner的VOL_*/试盘满分档须手动同步。
 docker/Dockerfile需包含market_data.py和notifications.py（新增Python模块须同步COPY行）。共振等级仍是状态分层，不是直接买入指令。
 
@@ -161,4 +161,6 @@ docker/Dockerfile需包含market_data.py和notifications.py（新增Python模块
 
 交易日用 XSHG 日历，目标日期不随个股缺失K线后移。NEAR 突破与 BREAK 守住的分母分开，价格尺度不能对齐则不可评估。复盘旧值保留每项 value_as_of 和 stale 标记；成功结果、行情证据及更新状态同事务提交。部分重叠的更新请求返回409，不静默遗漏批次。
 
-Docker新增 PostgreSQL17 命名卷与健康依赖，COPY包含history_store.py、reviews.py、migrations及static。测试只使用独立 HISTORY_TEST_DATABASE_URL，测试会清空该库历史表；扫描单测需mock history_store.archive/import_legacy，禁止测试数据进入真实 outbox。浏览器回归增加 tests/test_history.cjs。
+自动复盘由 server.py 调度（config.auto_review / auto_review_time，默认交易日16:00），滚动更新近三周批次并等扫描结束；只创建 reviews.start 任务，不在调度线程里直接跑 worker。超额收益基准是上证指数（symbol 固定 sh000001 直连，不走 tx_symbol——000001 会映射成平安银行），指数日线由 worker 落库 index_bars，stats GET 只读该表。行情证据按标的取最近一次成功帧（latest_observation 按 fetched_at 倒序），不绑定最新 job；批次卡片迷你图走 /api/history/batches/{id}/symbols/{code}/kline，同样只读存量数据。
+
+Docker新增 PostgreSQL17 命名卷与健康依赖，COPY包含history_store.py、reviews.py、migrations及static。测试只使用独立 HISTORY_TEST_DATABASE_URL，测试会清空该库历史表（含 index_bars）；扫描单测需mock history_store.archive/import_legacy，禁止测试数据进入真实 outbox。浏览器回归增加 tests/test_history.cjs。

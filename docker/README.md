@@ -13,11 +13,11 @@ docker/
 
 ## 配置（docker/.env）
 
-密码、Telegram 都从 `docker/.env` 进来，不进 git：
+密码、推送渠道（Telegram/飞书）都从 `docker/.env` 进来，不进 git：
 
 ```bash
 cp docker/.env.example docker/.env
-vi docker/.env     # 填 DASHBOARD_PASSWORD 和 POSTGRES_PASSWORD（必填）；Telegram 可选
+vi docker/.env     # 填 DASHBOARD_PASSWORD 和 POSTGRES_PASSWORD（必填）；TG_*/FEISHU_* 推送可选
 ```
 
 - Compose 启动时自动读取 compose 文件同目录的 `.env`（`-f docker/docker-compose.yml` 和 `cd docker` 两种方式都会命中）；
@@ -78,7 +78,7 @@ docker compose --env-file docker/.env -f docker/docker-compose.yml up -d dashboa
 # 0. 服务器上拿到完整代码（git clone 或 rsync；确保 market_data.py / notifications.py 等新文件都在）
 git clone <repo-url> && cd TradeGenuis-box
 
-# 1. 配置：复制模板并填密码/Telegram
+# 1. 配置：复制模板并填密码/推送渠道（Telegram/飞书）
 cp docker/.env.example docker/.env && vi docker/.env
 
 # 2. 构建并启动（在仓库根执行；首次拉镜像+构建约 1-3 分钟）

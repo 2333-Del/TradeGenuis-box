@@ -39,9 +39,12 @@ services:
       PGDATABASE: ${POSTGRES_DB:-tradegenuis}
       PGUSER: ${POSTGRES_USER:-tradegenuis}
       PGPASSWORD: ${POSTGRES_PASSWORD:?请设置数据库密码}
-      # Telegram 推送（可选，留空则用看板 banner 里保存的配置）
+      # Telegram 推送（可选，留空则读 data/config.json 的 tg_token/tg_chat）
       TG_BOT_TOKEN: "${TG_BOT_TOKEN:-}"
       TG_CHAT_ID: "${TG_CHAT_ID:-}"
+      # 飞书推送（可选，群自定义机器人 Webhook；留空则读 data/config.json 的 feishu_webhook/feishu_secret）
+      FEISHU_WEBHOOK_URL: "${FEISHU_WEBHOOK_URL:-}"
+      FEISHU_SECRET: "${FEISHU_SECRET:-}"
     volumes:
       - ../data:/app/data   # 扫描结果/缓存/自选池/配置 持久化在仓库根 data/（相对本文件）
 

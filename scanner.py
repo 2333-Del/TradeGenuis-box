@@ -28,6 +28,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import os
 from collections import Counter
 import json
@@ -1638,12 +1641,25 @@ def format_alert(rows: list[dict]) -> str:
 
 
 def _tg_from_config() -> tuple[str, str]:
-    """看板 banner 里保存的 Telegram 配置（data/config.json）作为兜底。"""
+    """data/config.json 里保存的 Telegram 配置作为兜底（无 UI 入口，手工编辑写入）。"""
     try:
         cfg = json.loads((DATA / "config.json").read_text(encoding="utf-8"))
         return str(cfg.get("tg_token") or ""), str(cfg.get("tg_chat") or "")
     except Exception:
         return "", ""
+
+
+def _split_text(text: str, limit: int = 3500) -> list[str]:
+    """按 UTF-16 码元分片，兼容中文及 emoji；不打印含令牌的异常 URL。"""
+    chunks, chunk, size = [], [], 0
+    for char in text:
+        width = len(char.encode("utf-16-le")) // 2
+        if size + width > limit:
+            chunks.append("".join(chunk)); chunk, size = [], 0
+        chunk.append(char); size += width
+    if chunk:
+        chunks.append("".join(chunk))
+    return chunks
 
 
 def telegram_send(text: str) -> bool:
@@ -1653,15 +1669,7 @@ def telegram_send(text: str) -> bool:
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     # 每块至多3500个UTF-16单元，兼容中文及emoji；不打印含Bot令牌的异常URL。
-    chunks, chunk, size = [], [], 0
-    for char in text:
-        width = len(char.encode("utf-16-le")) // 2
-        if size + width > 3500:
-            chunks.append("".join(chunk)); chunk, size = [], 0
-        chunk.append(char); size += width
-    if chunk:
-        chunks.append("".join(chunk))
-    for part in chunks:
+    for part in _split_text(text):
         try:
             r = HTTP.post(url, json={"chat_id": chat, "text": part,
                                      "disable_web_page_preview": True}, timeout=15)
@@ -1679,13 +1687,73 @@ def telegram_credentials():
             os_environ("TG_CHAT_ID") or os_environ("TELEGRAM_CHAT_ID") or configured_chat)
 
 
+# --------------------------------------------------------------------------- #
+# 飞书（群自定义机器人 Webhook）
+# --------------------------------------------------------------------------- #
+def _feishu_from_config() -> tuple[str, str]:
+    """data/config.json 里保存的飞书配置作为兜底（无 UI 入口，手工编辑写入）。"""
+    try:
+        cfg = json.loads((DATA / "config.json").read_text(encoding="utf-8"))
+        return str(cfg.get("feishu_webhook") or ""), str(cfg.get("feishu_secret") or "")
+    except Exception:
+        return "", ""
+
+
+def feishu_credentials() -> tuple[str, str]:
+    """(webhook, secret)。secret 仅在机器人启用「签名校验」时需要，可为空。"""
+    configured_webhook, configured_secret = _feishu_from_config()
+    return (os_environ("FEISHU_WEBHOOK_URL") or configured_webhook,
+            os_environ("FEISHU_SECRET") or configured_secret)
+
+
+def _feishu_sign(timestamp: str, secret: str) -> str:
+    """飞书加签：HMAC-SHA256 的 key 为 "{timestamp}\\n{secret}"，消息体为空串。"""
+    digest = hmac.new(f"{timestamp}\n{secret}".encode("utf-8"), digestmod=hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def feishu_send(text: str) -> bool:
+    webhook, secret = feishu_credentials()
+    if not webhook:
+        print("未配置 FEISHU_WEBHOOK_URL，跳过推送。", file=sys.stderr)
+        return False
+    for part in _split_text(text):
+        body = {"msg_type": "text", "content": {"text": part}}
+        if secret:
+            timestamp = str(int(time.time()))
+            body["timestamp"] = timestamp
+            body["sign"] = _feishu_sign(timestamp, secret)
+        try:
+            r = HTTP.post(webhook, json=body, timeout=15)
+            # 飞书对签名错误等也返回 HTTP 200，必须检查响应体；新版 code=0，旧版 StatusCode=0
+            data = r.json() if r.ok else {}
+            if not (data.get("code") == 0 or data.get("StatusCode") == 0):
+                print(f"飞书推送失败：{data.get('msg') or data.get('StatusMessage') or r.status_code}",
+                      file=sys.stderr)
+                return False
+        except Exception:
+            print("飞书请求失败", file=sys.stderr)  # 不打印含 hook 令牌的 URL
+            return False
+    return True
+
+
 def push_scan(rows, scope="market"):
-    if not all(telegram_credentials()):
-        return True  # 未配置时不启动传输
+    """双渠道推送：各自独立凭证判定与去重状态文件，互不影响重试。"""
+    ok = True
+    tg_token, tg_chat = telegram_credentials()
+    if tg_token and tg_chat:
+        ok &= _push_channel(rows, scope, telegram_send, DATA / "telegram_state.json")
+    webhook, secret = feishu_credentials()
+    if webhook:
+        ok &= _push_channel(rows, scope, feishu_send, DATA / "feishu_state.json")
+    return ok
+
+
+def _push_channel(rows, scope, send, state_path) -> bool:
     if scope == "crypto":
-        return telegram_send(format_alert(rows))
-    return notifications.dispatch([rs.qualify(r) for r in rows], DATA / "telegram_state.json",
-                                  scope, telegram_send, format_alert)
+        return send(format_alert(rows))
+    return notifications.dispatch([rs.qualify(r) for r in rows], state_path,
+                                  scope, send, format_alert)
 
 
 def os_environ(key: str) -> str:
@@ -1736,7 +1804,18 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.test_push:
-        return 0 if telegram_send(f"箱体突破看板连通测试 {now_str()}") else 1
+        msg = f"箱体突破看板连通测试 {now_str()}"
+        results = []
+        if all(telegram_credentials()):
+            results.append(("Telegram", telegram_send(msg)))
+        if feishu_credentials()[0]:
+            results.append(("飞书", feishu_send(msg)))
+        if not results:
+            print("未配置任何推送渠道（TG_BOT_TOKEN/TG_CHAT_ID 或 FEISHU_WEBHOOK_URL）。", file=sys.stderr)
+            return 1
+        for name, done in results:
+            print(f"{name} 连通测试：{'成功' if done else '失败'}")
+        return 0 if all(done for _, done in results) else 1
 
     def prog(msg: str):
         if not args.cron:
